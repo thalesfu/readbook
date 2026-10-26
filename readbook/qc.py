@@ -1,0 +1,79 @@
+"""合成质检：音高、语速，以及不改音高的变速。
+
+音高用自相关粗估（有声帧的中位数），只用来发现"春希飘进女声音区"这种大偏差，不追求精确。
+"""
+
+import re
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import soundfile as sf
+
+SR = 48000
+SPOKEN = re.compile(r"[\w]", re.U)
+
+
+def f0_median(a: np.ndarray, sr: int = SR) -> float | None:
+    a = a / (np.abs(a).max() + 1e-9)
+    a, sr = a[::3], sr // 3
+    n = int(0.04 * sr)
+    lo, hi = int(sr / 400), int(sr / 70)
+    fs = []
+    for i in range(0, len(a) - n, n // 2):
+        x = a[i:i + n] - a[i:i + n].mean()
+        if np.sqrt((x ** 2).mean()) < 0.02:
+            continue
+        r = np.correlate(x, x, "full")[n - 1:]
+        r /= r[0] + 1e-9
+        k = lo + int(np.argmax(r[lo:hi]))
+        if r[k] > 0.5:
+            fs.append(sr / k)
+    return float(np.median(fs)) if len(fs) > 5 else None
+
+
+def speech_seconds(a: np.ndarray, sr: int = SR) -> float:
+    """去掉首尾静音后的时长。"""
+    env = np.abs(a) > 0.02 * (np.abs(a).max() + 1e-9)
+    idx = np.flatnonzero(env)
+    return (idx[-1] - idx[0]) / sr if len(idx) else 0.0
+
+
+def rate(a: np.ndarray, text: str, sr: int = SR) -> float | None:
+    """每秒字数；不到 4 个字的句子不算。"""
+    n = len(SPOKEN.findall(text))
+    s = speech_seconds(a, sr)
+    return n / s if n >= 4 and s > 0 else None
+
+
+def stretch(a: np.ndarray, factor: float, sr: int = SR) -> np.ndarray:
+    """变速不变调；factor > 1 变快。"""
+    if abs(factor - 1) < 0.02:
+        return a
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = Path(d) / "a.wav", Path(d) / "b.wav"
+        sf.write(src, a, sr)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+                        "-filter:a", f"atempo={factor:.4f}", str(dst)], check=True)
+        out, _ = sf.read(dst, dtype="float32")
+    return out
+
+
+def max_jump(a: np.ndarray, target_f0: float, sr: int = SR) -> float:
+    """句内每半秒一段估音高，返回最高一段与目标的比值；用来抓"说着说着变调"。
+
+    低于目标一半的估计多半是倍频误判，不算。
+    """
+    seg = int(0.5 * sr)
+    fs = [f0_median(a[i:i + seg], sr) for i in range(0, max(len(a) - seg // 2, 1), seg)]
+    fs = [f for f in fs if f and f > target_f0 * 0.5]
+    return max(fs) / target_f0 if fs else 1.0
+
+
+def judge(a: np.ndarray, text: str, target_f0: float, target_rate: float) -> tuple[float, dict]:
+    """偏差分数（越小越好）和明细。音高按对数偏差，语速按比例偏差。"""
+    f, r = f0_median(a), rate(a, text)
+    df = abs(np.log(f / target_f0)) if f else 0.0
+    dr = abs(np.log(r / target_rate)) if r else 0.0
+    return df * 2 + dr, {"f0": f, "rate": r}

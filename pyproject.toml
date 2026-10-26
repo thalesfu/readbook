@@ -1,0 +1,16 @@
+[project]
+name = "readbook"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "ebooklib>=0.20",
+    "mlx-audio>=0.6.1",
+    "numpy>=2.5.4",
+    "pyyaml>=6.0.3",
+    "soundfile>=0.14.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
