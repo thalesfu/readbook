@@ -26,9 +26,9 @@ Blocked by: 无（可以立即开始）
   - ffmpeg 9.0.2，用 winget 装在用户目录；
   - Claude Code 2.1.311，用官方脚本装到 `~/.local/bin`，用户已经登录，`claude -p --json-schema` 测过能用。
   - 不装 CUDA Toolkit，也不装 flash-attn。
-- **依赖按平台分开**：`pyproject.toml` 里，Mac 装 mlx-audio；Windows 装 cu128 版 torch（单独的 PyTorch 源）和 pip-system-certs。另外补上了 scipy（`mix.py` 直接用到它，以前是 mlx-audio 顺带装进来的）。Mac 那边锁定的版本一个都没变。
+- **依赖按平台分开**：`pyproject.toml` 里，Mac 装 mlx-audio；Windows 装 cu128 版 torch（单独的 PyTorch 源）和 truststore（当初装的是 pip-system-certs，05 号票换掉了，见下一条）。另外补上了 scipy（`mix.py` 直接用到它，以前是 mlx-audio 顺带装进来的）。Mac 那边锁定的版本一个都没变。
 - **路径配置**（用户定的）：每个平台一份配置，都进 git：`config/windows.yaml`、`config/mac.yaml`，由 `readbook/config.py` 按 `sys.platform` 选。原来写死的 `GAME`、`TOOLS`、`INDEX_DIR`、`COVER` 都改成从这里读。游戏就用现有的安装位置 `C:\Others\WHITE ALBUM2_Chs`，不挪。
-- **Norton 换证书**（用户定的）：Norton 不动，每个环境各自改用 Windows 证书库。uv 在 `%APPDATA%\uv\uv.toml` 里设 `system-certs = true`；Python 靠 pip-system-certs；winget 装软件时要加 `--source winget`。以后建 IndexTTS2、Applio 的环境，**也要各装一个 pip-system-certs**。
+- **Norton 换证书**（用户定的）：Norton 不动，每个环境各自改用 Windows 证书库。uv 在 `%APPDATA%\uv\uv.toml` 里设 `system-certs = true`；Python 在 `readbook/config.py` 里调用 `truststore.inject_into_ssl()`（只在 Windows 上）；winget 装软件时要加 `--source winget`。当初 Python 用的是 pip-system-certs，05 号票发现它注入的是 pip 自带的那份 truststore，和 huggingface_hub 2.x 自己用的那份叠在一起，一联网就 `RecursionError`，所以换掉了。以后建 IndexTTS2、Applio 的环境：huggingface_hub 是老版（用 requests）的，可以照旧加 pip-system-certs；是 2.x 的，就在入口调用 `truststore.inject_into_ssl()`。
 - **为 Windows 改的代码**：
   - `claude -p` 和 CAM++ 子进程交换文本时显式用 UTF-8（Windows 默认按 GBK）；
   - `wa2` 输出 jsonl 时固定用 UTF-8；
