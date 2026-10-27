@@ -13,8 +13,11 @@ dependencies = [
     # Windows 5090（Blackwell）：cu128 这条线最新到 2.11.0
     "torch==2.11.0; sys_platform == 'win32'",
     "torchaudio==2.11.0; sys_platform == 'win32'",
-    # Norton 的加密连接扫描会换掉证书：让 requests/httpx 认 Windows 证书库
-    "pip-system-certs>=5.3; sys_platform == 'win32'",
+    # Norton 的加密连接扫描会换掉证书：readbook/config.py 里用 truststore 改认 Windows 证书库。
+    # 不用 pip-system-certs：它注入的是 pip 自带的那份 truststore，和 huggingface_hub 用的这份叠在一起会无限递归
+    "truststore>=0.10.5; sys_platform == 'win32'",
+    "funasr>=1.4.16 ; sys_platform == 'win32'",
+    "transformers>=5.20.2 ; sys_platform == 'win32'",
 ]
 
 [[tool.uv.index]]

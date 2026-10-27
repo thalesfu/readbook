@@ -1,4 +1,5 @@
-"""CAM++ 说话人向量服务，在 IndexTTS2 的环境里跑（那边有 PyTorch 和 campplus_cn_common.bin）。
+"""CAM++ 说话人向量服务，Mac 上在 IndexTTS2 的环境里跑（那边有 PyTorch 和 campplus_cn_common.bin）。
+Windows 上 readbook 自己的环境就有 PyTorch，不用它，见 speaker.py。
 
 协议：stdin 每行一个 wav 路径，stdout 每行回一个 JSON 数组（192 维、已归一化的向量）。
 不依赖 readbook 包。

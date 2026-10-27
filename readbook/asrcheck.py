@@ -2,19 +2,26 @@
 
 CER 高不一定是读错：哭腔、拟声词、"………" 这种本来就难识别。所以这里只给排序，最后要人听。
 
-mlx-audio 的 Whisper 偶尔会在某一句上死循环（和音频内容无关），所以识别放在子进程里，
-每句限时，超时就杀掉重启，这一句记为识别超时。结果逐句追加到缓存，中断后重跑不重复。
+Windows 上用官方 PyTorch 版（TorchWhisper），在本进程里跑。Mac 上用 mlx-audio 版：它偶尔会在
+某一句上死循环（和音频内容无关），所以识别放在子进程里，每句限时，超时就杀掉重启，这一句记为
+识别超时。结果逐句追加到缓存，中断后重跑不重复。
 """
 
 import json
 import multiprocessing as mp
 import re
+import sys
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
+from .config import hf_model
 from .synth import tts_text
 
 STT = "mlx-community/whisper-large-v3-turbo"
-PROCESSOR = "openai/whisper-large-v3-turbo"  # mlx-community 的仓库里没带分词器
+PROCESSOR = "openai/whisper-large-v3-turbo"  # mlx-community 的仓库里没带分词器；PyTorch 版直接用这个仓库
+PROMPT = "以下是普通话的句子。"
 PUNCT = re.compile(r"[\W_]+", re.U)
 TIMEOUT = 30
 
@@ -42,13 +49,45 @@ def _worker(inbox: mp.Queue, outbox: mp.Queue):
     while True:
         path = inbox.get()
         # 只用温度 0、不接上文：哭声、喘气会让默认的多温度回退反复重试
-        r = model.generate(path, language="zh", initial_prompt="以下是普通话的句子。",
+        r = model.generate(path, language="zh", initial_prompt=PROMPT,
                            temperature=0.0, condition_on_previous_text=False)
         outbox.put(r.text.strip())
 
 
+class TorchWhisper:
+    """官方 PyTorch 版，fp16 跑在 GPU 上。和 mlx 版一样只用温度 0（贪心）、不接上文。"""
+
+    def __init__(self):
+        import torch
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        path = hf_model(PROCESSOR, ["*.json", "*.txt", "*.safetensors"])
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = torch.float16 if self.device == "cuda" else torch.float32
+        self.processor = WhisperProcessor.from_pretrained(path)
+        self.model = WhisperForConditionalGeneration.from_pretrained(path, dtype=self.dtype).to(self.device).eval()
+        self.prompt = self.processor.get_prompt_ids(PROMPT, return_tensors="pt").to(self.device)
+
+    def transcribe_audio(self, a: np.ndarray, sr: int) -> str:
+        import torch
+        import torchaudio
+
+        if a.ndim > 1:
+            a = a.mean(axis=1)
+        w = torchaudio.functional.resample(torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32)), sr, 16000)
+        feats = self.processor(w.numpy(), sampling_rate=16000, return_tensors="pt").input_features
+        with torch.no_grad():
+            ids = self.model.generate(feats.to(self.device, self.dtype), language="zh", task="transcribe",
+                                      prompt_ids=self.prompt, max_new_tokens=200)
+        text = self.processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+        return text.removeprefix(PROMPT).strip()
+
+
 class Checker:
     def __init__(self):
+        if sys.platform == "win32":
+            self.whisper = TorchWhisper()
+            return
         self.ctx = mp.get_context("spawn")
         self.proc = None
         self._start()
@@ -63,6 +102,9 @@ class Checker:
         assert self.outbox.get(timeout=300) == "ready"
 
     def transcribe(self, path: Path) -> str | None:
+        if sys.platform == "win32":
+            a, sr = sf.read(path, dtype="float32")
+            return self.whisper.transcribe_audio(a, sr)
         self.inbox.put(str(path))
         try:
             return self.outbox.get(timeout=TIMEOUT)

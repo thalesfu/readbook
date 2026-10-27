@@ -82,6 +82,13 @@ def process(a: np.ndarray, row: dict, p: float, inner: bool) -> np.ndarray:
     return pan(a, p)
 
 
+def gap(prev: dict, row: dict) -> float:
+    """两句之间插多少秒静音。"""
+    if row["type"] != "台词" or prev["type"] != "台词":
+        return GAP["narration"]
+    return GAP["same"] if row["speaker"] == prev["speaker"] else GAP["change"]
+
+
 def assemble(rows: list[dict], wav_dir: Path, cast: dict, inner: bool,
              marks: list[float] | None = None) -> np.ndarray:
     """marks 不为 None 时，按顺序记下每句的起始秒数（给对照剧本用）。"""
@@ -92,12 +99,9 @@ def assemble(rows: list[dict], wav_dir: Path, cast: dict, inner: bool,
         p = cast["characters"].get(row["speaker"], {}).get("pan", 0.0)
         st = process(a, row, p, inner)
         if prev is not None:
-            if row["type"] != "台词" or prev["type"] != "台词":
-                gap = GAP["narration"]
-            else:
-                gap = GAP["same"] if row["speaker"] == prev["speaker"] else GAP["change"]
-            chunks.append(np.zeros((int(gap * SR), 2), dtype=np.float32))
-            pos += int(gap * SR)
+            n = int(gap(prev, row) * SR)
+            chunks.append(np.zeros((n, 2), dtype=np.float32))
+            pos += n
         if marks is not None:
             marks.append(pos / SR)
         chunks.append(st.astype(np.float32))
