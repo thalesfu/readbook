@@ -17,7 +17,12 @@ dependencies = [
     # 不用 pip-system-certs：它注入的是 pip 自带的那份 truststore，和 huggingface_hub 用的这份叠在一起会无限递归
     "truststore>=0.10.5; sys_platform == 'win32'",
     "funasr>=1.4.16 ; sys_platform == 'win32'",
-    "transformers>=5.20.2 ; sys_platform == 'win32'",
+    # 官方 PyTorch 版 Qwen3-TTS（06 号票）。它把 transformers 钉在 4.57.3，Whisper 评测跟着用这一版
+    "qwen-tts==0.1.1 ; sys_platform == 'win32'",
+    "transformers==4.57.3 ; sys_platform == 'win32'",
+    # transformers 4.57.3 要 huggingface_hub <1.0，mlx-audio 要 ≥1.0：分平台写，uv 才会分开解
+    "huggingface-hub<1.0 ; sys_platform == 'win32'",
+    "huggingface-hub>=1.0 ; sys_platform == 'darwin'",
 ]
 
 [[tool.uv.index]]

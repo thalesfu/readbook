@@ -1,44 +1,62 @@
 """按小样里试听认可的配置，做任意一段：取台词 → 剧本化 → 合成 → 混音 → MP3 和对照剧本。
 
-认可的配置（"混合版"）：
-- 春希：分情绪版的定妆音（moods/refs.yaml），旁白和心里话用"讲述"；
-- 雪菜：低温版的单一锚点（refs.yaml），不分情绪；
+认可的配置（"混合版"），定妆音见 books/wa2/voices/voices.yaml：
+- 春希：分情绪版的定妆音，旁白和心里话用"讲述"；
+- 雪菜：低温版的单一锚点，不分情绪；
+- 依绪、武也：锚点版，情绪定妆音从锚点派生；逐句多一道 CAM++ 门槛（和锚点 ≥0.65），最多 6 次；
 - Qwen3-TTS Base，温度 0.6，句内变调上限 1.45，最多 5 次，语速拉回目标的 0.85–1.2 倍。
+Mac 上用 mlx-audio 版，Windows 上用官方 PyTorch 版（见 bakeoff.TorchQwen）。
 
-    uv run python -m readbook.passage 2002 "01 第二部-共通" 2010-11-25 2002
+    uv run python -m readbook.passage 小样
+    uv run python -m readbook.passage "2010-11-25 〈2002〉" "01 第二部-共通" 2010-11-25 2002
 """
 
 import json
 import sys
-from pathlib import Path
+import time
 
 import numpy as np
 import soundfile as sf
 import yaml
 
 from . import qc, wa2
-from .bakeoff import MOOD_DIR, QWEN_BASE, WORK, finish, mood_ref, ok, to48k
+from .bakeoff import anchor_ref, load_qwen, mood_ref, sample_rows, synth_anchor, synth_qc
 from .scriptize import load_cast, scriptize
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT, read_jsonl, write_jsonl
 from .voices import SR
 
+VOICES = BOOK / "voices"
 # 说话人 → 参考来源
-VOICE_SOURCE = {"春希": "moods", "雪菜": "single", "依绪": "single", "武也": "single"}
+VOICE_SOURCE = {"春希": "moods", "雪菜": "single", "依绪": "anchor", "武也": "anchor"}
 TYPE = {"旁白": "旁白", "台词": "台词", "心理活动": "心里话"}
 
 
-def pick_ref(row, cast, single, moods_refs):
-    if VOICE_SOURCE.get(row["speaker"]) == "moods":
-        return mood_ref(row, moods_refs, cast)
-    return single[row["speaker"]]
+def load_voices() -> dict:
+    """voices.yaml → {角色: {情绪: 参考}}，音频换成绝对路径。"""
+    data = yaml.safe_load((VOICES / "voices.yaml").read_text(encoding="utf-8"))
+    return {n: {m: {"mood": m, "zh_audio": str(VOICES / v["audio"]), "zh_text": v["text"],
+                    "f0": v["f0"], "rate": v["rate"]} for m, v in c["定妆音"].items()}
+            for n, c in data.items()}
 
 
-def main(name: str, route: str, day: str, from_sid: str):
-    date = tuple(int(x) for x in day.split("-"))
+def pick_ref(row, cast, voices):
+    n = row["speaker"]
+    src = VOICE_SOURCE.get(n)
+    if src == "moods":
+        return mood_ref(row, {n: {**voices[n], "_have": sorted(voices[n])}}, cast)
+    if src == "anchor":
+        return anchor_ref(row, voices, cast)
+    return voices[n]["平常"]
+
+
+def load_rows(name: str, route: str | None, day: str | None, from_sid: str | None) -> list[dict]:
+    if name == "小样":
+        return sample_rows()
     cast = load_cast(BOOK / "cast.yaml")
     script = BOOK / "script" / f"{name}.jsonl"
     if not script.exists():
+        date = tuple(int(x) for x in day.split("-"))
         lines = [l for l in wa2.load_day(route, date) if l.sid >= from_sid]
         raw = []
         for i, l in enumerate(lines):
@@ -47,18 +65,19 @@ def main(name: str, route: str, day: str, from_sid: str):
         write_jsonl(OUT / "raw" / f"{name}.jsonl", raw)
         write_jsonl(script, scriptize(raw, cast))
         print("剧本化完成", len(raw), "句", flush=True)
-    rows = read_jsonl(script)
+    return read_jsonl(script)
 
-    single = yaml.safe_load((WORK / "refs.yaml").read_text(encoding="utf-8"))
-    moods_refs = yaml.safe_load((MOOD_DIR / "refs.yaml").read_text(encoding="utf-8"))
+
+def main(name: str, route: str | None = None, day: str | None = None, from_sid: str | None = None):
+    rows = load_rows(name, route, day, from_sid)
+    cast = load_cast(BOOK / "cast.yaml")
+    voices = load_voices()
     lex = load_yaml(BOOK / "lexicon.yaml")
     out = OUT / "passage" / name
     wav = out / "wav"
     wav.mkdir(parents=True, exist_ok=True)
 
-    from mlx_audio.tts.utils import load_model
-
-    model = None
+    model = sp = None
     log = json.loads((out / "qc.json").read_text(encoding="utf-8")) if (out / "qc.json").exists() else {}
     for r in rows:
         f = wav / f"{r['idx']:04d}.wav"
@@ -68,17 +87,18 @@ def main(name: str, route: str, day: str, from_sid: str):
         if not qc.SPOKEN.search(text):
             sf.write(f, np.zeros(int(0.8 * SR), dtype=np.float32), SR)
             continue
-        model = model or load_model(QWEN_BASE)
-        ref = pick_ref(r, cast, single, moods_refs)
-        cands = []
-        for _ in range(5):
-            res = list(model.generate(text=text, ref_audio=ref["zh_audio"], ref_text=ref["zh_text"],
-                                      lang_code="chinese", temperature=0.6))
-            a = to48k(np.concatenate([np.array(x.audio, dtype=np.float32) for x in res]), res[0].sample_rate)
-            cands.append(a)
-            if ok(a, text, ref, 1.45):
-                break
-        a, m = finish(cands, text, ref)
+        model = model or load_qwen()
+        ref = pick_ref(r, cast, voices)
+        t = time.perf_counter()
+        if VOICE_SOURCE.get(r["speaker"]) == "anchor":
+            if sp is None:
+                from .speaker import SpeakerSim
+
+                sp = SpeakerSim()
+            a, m = synth_anchor(model, sp, text, ref)
+        else:
+            a, m = synth_qc(model, text, ref)
+        m.update(ref=ref["mood"], secs=round(time.perf_counter() - t, 2), dur=round(len(a) / SR, 2))
         sf.write(f, a, SR)
         log[str(r["idx"])] = {k: (float(v) if isinstance(v, (np.floating, float)) else v) for k, v in m.items()}
         print(r["idx"], log[str(r["idx"])], flush=True)

@@ -30,7 +30,7 @@ import soundfile as sf
 import yaml
 
 from . import qc, wa2
-from .config import INDEX_DIR
+from .config import INDEX_DIR, hf_model
 from .scriptize import load_cast
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT, read_jsonl
@@ -47,6 +47,7 @@ REF_ROUTES = ("01 第二部-共通", "02 第二部-雪菜线", "07 第三部-共
 ZH_RATE = 4.2  # 普通话有声书的常见语速（字/秒），按角色原声的快慢再调
 VOXCPM = "mlx-community/VoxCPM2-bf16"
 QWEN_BASE = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
+QWEN_TORCH = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"  # Windows 上用的官方 PyTorch 版
 
 
 def sample_rows() -> list[dict]:
@@ -368,15 +369,13 @@ def anchor_ref(row: dict, refs: dict, cast: dict) -> dict:
 
 def cmd_synth_anchor(tries=6, method="qwen-anchor"):
     """Qwen3 逐句合成，质检多一道：和锚点的 CAM++ 相似度低于 SIM_LINE 就重做。"""
-    from mlx_audio.tts.utils import load_model
-
     from .speaker import SpeakerSim
 
     cast = load_cast(BOOK / "cast.yaml")
     refs = yaml.safe_load((ANCHOR_DIR / "refs.yaml").read_text(encoding="utf-8"))
     lex = load_yaml(BOOK / "lexicon.yaml")
     sp = SpeakerSim()
-    model = load_model(QWEN_BASE)
+    model = load_qwen()
     out = WORK / method
     out.mkdir(parents=True, exist_ok=True)
     log = {}
@@ -386,30 +385,114 @@ def cmd_synth_anchor(tries=6, method="qwen-anchor"):
         if f.exists() or not qc.SPOKEN.search(text):
             continue
         ref = anchor_ref(r, refs, cast)
-        e_anc = sp.embed(ref["anchor"])
-        cands = []
-        for _ in range(tries):
-            res = list(model.generate(text=text, ref_audio=ref["zh_audio"], ref_text=ref["zh_text"],
-                                      lang_code="chinese", temperature=0.6))
-            a = to48k(np.concatenate([np.array(x.audio, dtype=np.float32) for x in res]), res[0].sample_rate)
-            s = sp.sim(sp.embed_audio(a, SR), e_anc) if len(a) > SR // 2 else 1.0  # 太短的测不准
-            cands.append((s, a))
-            if s >= SIM_LINE and ok(a, text, ref, 1.45):
-                break
-        # 先看音色：过线的里面再按音高、语速挑；都没过线就取最像锚点的
-        passed = [a for s, a in cands if s >= SIM_LINE]
-        if passed:
-            a, m = finish(passed, text, ref)
-        else:
-            a, m = finish([max(cands, key=lambda x: x[0])[1]], text, ref)
-        m["sim"] = round(max(s for s, _ in cands), 3)
+        a, m = synth_anchor(model, sp, text, ref, tries)
         sf.write(f, a, SR)
         log[r["idx"]] = {k: (float(v) if isinstance(v, (np.floating, float)) else v) for k, v in m.items()}
         print(method, r["idx"], log[r["idx"]], flush=True)
     (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def synth_qc(model, text: str, ref: dict, tries=5, temperature=0.6, jump=1.45) -> tuple[np.ndarray, dict]:
+    """Qwen3 逐句合成：音高、语速、句内变调过了就停，否则最多 tries 次取最好。"""
+    cands = []
+    for a in qwen_takes(model, text, ref, tries, temperature):
+        cands.append(a)
+        if ok(a, text, ref, jump):
+            break
+    return finish(cands, text, ref)
+
+
+def synth_anchor(model, sp, text: str, ref: dict, tries=6) -> tuple[np.ndarray, dict]:
+    e_anc = sp.embed(ref["anchor"])
+    cands = []
+    for a in qwen_takes(model, text, ref, tries, 0.6):
+        s = sp.sim(sp.embed_audio(a, SR), e_anc) if len(a) > SR // 2 else 1.0  # 太短的测不准
+        cands.append((s, a))
+        if s >= SIM_LINE and ok(a, text, ref, 1.45):
+            break
+    # 先看音色：过线的里面再按音高、语速挑；都没过线就取最像锚点的
+    passed = [a for s, a in cands if s >= SIM_LINE]
+    if passed:
+        a, m = finish(passed, text, ref)
+    else:
+        a, m = finish([max(cands, key=lambda x: x[0])[1]], text, ref)
+    m["sim"] = round(max(s for s, _ in cands), 3)
+    return a, m
+
+
 # ---------- 合成与质检 ----------
+
+class TorchQwen:
+    """Windows 上用官方 PyTorch 版 Qwen3-TTS（qwen-tts），参数对齐 mlx-audio 0.6.1 的带文本复刻：
+    - 非流式布局（non_streaming_mode=True）：mlx 版本来就是这样；官方默认的模拟流式会越读越快；
+    - 子 talker 用和主 talker 同一个温度：mlx 两者共用，官方的子 talker 默认 0.9；
+    - 重复惩罚 1.5、只罚最近 64 个首码本 token：mlx 在复刻模式下强制这样，官方默认 1.05 罚全部。
+      官方 generate 不往下传 logits_processor，只能包一层 talker.generate。
+    - 语音编码器（编参考音、解码波形）用存储的 fp32：from_pretrained 会把它跟着主模型转成 bf16，
+      mlx-audio 不转。实测 bf16 下雪菜的候选有一半音色跑偏（像锚点 0.2–0.5），fp32 降到四分之一（06 号票）。
+    attention 用 sdpa，不装 flash-attn。一句的几个候选当一批生成；生成上限按句长定，
+    比 ok() 的时长上限多 1 秒，防止一条失控拖住整批。
+    """
+
+    def __init__(self):
+        import torch
+        from qwen_tts import Qwen3TTSModel
+        from qwen_tts.inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class WindowPenalty(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                if input_ids.shape[1] == 0:
+                    return scores
+                ids = input_ids[:, -64:]
+                s = scores.gather(1, ids)
+                return scores.scatter(1, ids, torch.where(s < 0, s * 1.5, s / 1.5))
+
+        path = hf_model(QWEN_TORCH)
+        self.tts = Qwen3TTSModel.from_pretrained(str(path), device_map="cuda:0",
+                                                 dtype=torch.bfloat16, attn_implementation="sdpa")
+        self.tts.model.load_speech_tokenizer(Qwen3TTSTokenizer.from_pretrained(
+            str(path / "speech_tokenizer"), device_map="cuda:0", dtype=torch.float32))
+        talker, generate = self.tts.model.talker, self.tts.model.talker.generate
+
+        def windowed(*a, **kw):
+            return generate(*a, **{**kw, "repetition_penalty": 1.0,
+                                   "logits_processor": LogitsProcessorList([WindowPenalty()])})
+
+        talker.generate = windowed
+        self.prompts = {}
+
+    def takes(self, text: str, ref: dict, n: int, temperature: float | None) -> list[np.ndarray]:
+        key = ref["zh_audio"]
+        if key not in self.prompts:
+            self.prompts[key] = self.tts.create_voice_clone_prompt(ref_audio=key, ref_text=ref["zh_text"])
+        temp = {"temperature": temperature, "subtalker_temperature": temperature} if temperature else {}
+        wavs, sr = self.tts.generate_voice_clone(
+            text=[text] * n, language="Chinese", voice_clone_prompt=self.prompts[key], non_streaming_mode=True,
+            top_k=50, subtalker_top_k=50, top_p=1.0, subtalker_top_p=1.0, **temp,
+            max_new_tokens=int(12.5 * (3.5 + 0.5 * len(qc.SPOKEN.findall(text)))))
+        return [to48k(np.asarray(w, dtype=np.float32), sr) for w in wavs]
+
+
+def load_qwen():
+    if sys.platform == "win32":
+        return TorchQwen()
+    from mlx_audio.tts.utils import load_model
+
+    return load_model(QWEN_BASE)
+
+
+def qwen_takes(model, text: str, ref: dict, tries: int, temperature: float | None):
+    """逐个给出候选（48k）。Mac 上一次生成一个，调用方 break 后就不再生成；
+    Windows 上一批生成好再逐个给，调用方按同样的顺序挑，结果的分布和逐个生成一样。"""
+    if isinstance(model, TorchQwen):
+        yield from model.takes(text, ref, tries, temperature)
+        return
+    for _ in range(tries):
+        res = list(model.generate(text=text, ref_audio=ref["zh_audio"], ref_text=ref["zh_text"],
+                                  lang_code="chinese", temperature=temperature))
+        yield to48k(np.concatenate([np.array(x.audio, dtype=np.float32) for x in res]), res[0].sample_rate)
+
 
 def finish(cands: list[np.ndarray], text: str, ref: dict) -> tuple[np.ndarray, dict]:
     """从候选里挑偏差最小的，再把语速拉回目标的 0.85–1.2 倍。"""
@@ -446,8 +529,6 @@ METHODS = {
 
 
 def cmd_synth(methods: list[str]):
-    from mlx_audio.tts.utils import load_model
-
     refs = yaml.safe_load((WORK / "refs.yaml").read_text(encoding="utf-8"))
     mrefs = yaml.safe_load((MOOD_DIR / "refs.yaml").read_text(encoding="utf-8")) \
         if (MOOD_DIR / "refs.yaml").exists() else {}
@@ -456,7 +537,12 @@ def cmd_synth(methods: list[str]):
     rows = sample_rows()
     for method in methods:
         repo, temperature, jump, tries = METHODS[method]
-        model = load_model(repo)
+        if repo == VOXCPM:
+            from mlx_audio.tts.utils import load_model
+
+            model = load_model(repo)
+        else:
+            model = load_qwen()
         out = WORK / method
         out.mkdir(parents=True, exist_ok=True)
         log = {}
@@ -466,21 +552,19 @@ def cmd_synth(methods: list[str]):
             if f.exists() or not qc.SPOKEN.search(text):
                 continue
             ref = mood_ref(r, mrefs, cast) if method == "qwen-mood" else refs[r["speaker"]]
-            cands = []
-            for _ in range(tries):
-                if repo == VOXCPM:
-                    gen = model.generate(text=text, ref_audio=ref["zh_audio"],
-                                         prompt_audio=ref["zh_audio"], prompt_text=ref["zh_text"])
-                else:
-                    gen = model.generate(text=text, ref_audio=ref["zh_audio"], ref_text=ref["zh_text"],
-                                         lang_code="chinese", temperature=temperature)
-                res = list(gen)
-                a = to48k(np.concatenate([np.array(x.audio, dtype=np.float32) for x in res]),
-                          res[0].sample_rate)
-                cands.append(a)
-                if ok(a, text, ref, jump):
-                    break
-            a, m = finish(cands, text, ref)
+            if repo == VOXCPM:
+                cands = []
+                for _ in range(tries):
+                    res = list(model.generate(text=text, ref_audio=ref["zh_audio"],
+                                              prompt_audio=ref["zh_audio"], prompt_text=ref["zh_text"]))
+                    a = to48k(np.concatenate([np.array(x.audio, dtype=np.float32) for x in res]),
+                              res[0].sample_rate)
+                    cands.append(a)
+                    if ok(a, text, ref, jump):
+                        break
+                a, m = finish(cands, text, ref)
+            else:
+                a, m = synth_qc(model, text, ref, tries, temperature, jump)
             sf.write(f, a, SR)
             log[r["idx"]] = m
             print(method, r["idx"], m, flush=True)
