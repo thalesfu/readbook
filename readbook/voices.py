@@ -3,6 +3,8 @@
 - 角色参考：按语音编号挑几句情绪平稳、长度适中的台词，拼成一段 12–18 秒的音频，
   同时拼出对应的日文逐字稿（VoxCPM2 的"带文本复刻"要用）。
 - 逐句原声：把某一天台词各自的原声导出来，供"逐句情绪参考"那一版用。
+
+    uv run python -m readbook.voices 2002_0000_02.OGG ...   # 导出到 out/voice/
 """
 
 import io
@@ -90,3 +92,15 @@ def build_reference(vp: VoicePak, code: str, target=(12.0, 18.0), gap=0.35):
     audio = audio / peak * 0.89
     text = "".join(p[1] if p[1][-1] in "。！？…" else p[1] + "。" for p in picked)
     return audio, text, [p[0] for p in picked]
+
+
+if __name__ == "__main__":
+    from .trial import OUT
+
+    out = OUT / "voice"
+    out.mkdir(parents=True, exist_ok=True)
+    vp = VoicePak()
+    for name in sys.argv[1:]:
+        path = out / name.replace(".OGG", ".wav")
+        sf.write(path, vp.audio(name), SR)
+        print(path)

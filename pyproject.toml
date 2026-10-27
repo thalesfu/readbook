@@ -5,12 +5,27 @@ description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
     "ebooklib>=0.20",
-    "mlx-audio>=0.6.1",
+    "mlx-audio>=0.6.1; sys_platform == 'darwin'",
     "numpy>=2.5.4",
     "pyyaml>=6.0.3",
+    "scipy>=1.18.1",
     "soundfile>=0.14.0",
+    # Windows 5090（Blackwell）：cu128 这条线最新到 2.11.0
+    "torch==2.11.0; sys_platform == 'win32'",
+    "torchaudio==2.11.0; sys_platform == 'win32'",
+    # Norton 的加密连接扫描会换掉证书：让 requests/httpx 认 Windows 证书库
+    "pip-system-certs>=5.3; sys_platform == 'win32'",
 ]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128", marker = "sys_platform == 'win32'" }
+torchaudio = { index = "pytorch-cu128", marker = "sys_platform == 'win32'" }

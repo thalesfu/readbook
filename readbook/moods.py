@@ -73,7 +73,7 @@ def label(name: str, desc: str, lines: list[dict]) -> dict[int, str]:
     body = "\n".join(json.dumps(x, ensure_ascii=False) for x in lines)
     cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence",
            "--json-schema", json.dumps(LABEL_SCHEMA, ensure_ascii=False)]
-    res = subprocess.run(cmd, input=head + body, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, input=head + body, capture_output=True, text=True, encoding="utf-8", check=True)
     out = json.loads(res.stdout)
     data = out.get("structured_output") or json.loads(out["result"])
     return {x["i"]: x["mood"] for x in data["items"]}

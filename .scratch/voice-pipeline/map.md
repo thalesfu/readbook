@@ -31,6 +31,7 @@ Label: wayfinder:map
 
 <!-- 每张关掉的票一行：标题链接 + 一句结论 -->
 
+- [在 5090 上搭好可复现的基础环境](issues/01-windows-env.md)：Windows 上已经能读游戏剧本和原声，〈2002〉65 句对上了；torch 2.11 cu128、ffmpeg、Claude Code 都装好并验证过；本机路径放在 `config/windows.yaml`、`config/mac.yaml`，按平台自动选；Norton 会换证书，每个 Python 环境都要装 pip-system-certs；IndexTTS2 还没装。细节见 `docs/audiobook/小说转有声书运行环境.md`。
 - [Qwen3-TTS 官方 PyTorch 版在 Windows 上推理](issues/04-qwen3-torch-research.md)：装 torch cu128 加 `qwen-tts`，用 sdpa、不装 flash-attn；必须用非流式模式防止越读越快；子 talker 温度和 repetition_penalty 要另外对齐 mlx 版；没有语速参数；速度数字都还没实测。
 - [RVC 在 50 系 Windows 上怎么训、怎么用](issues/03-rvc-research.md)：首选 Applio（cu128）；每个角色先用约 45 分钟干净原声训第一版、剔除极端情绪句；推理从 rmvpe、`index_rate` 0.3、`protect` 0.33 起步；日语训练转中文机制上可行，但 `index_rate` 要低，用字错率把关；情绪和字错率的影响要自测。
 - [IndexTTS-2.5 在 5090 上怎么用](issues/02-indextts25-research.md)：2.5 已公开，多了时长控制、只支持 bf16；情绪向量是混入样本库示例，权重总和要压到 0.8 以下才不漏音色；"害羞""轻声"改用角色自己的参考音；社区反馈 2.5 中文不如 2.0，原型要两版都做。

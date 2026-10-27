@@ -12,7 +12,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-INDEX_DIR = Path("~/codes/github.com/index-tts/index-tts").expanduser()
+from .config import INDEX_DIR
+
 WORKER = Path(__file__).with_name("campplus_worker.py")
 
 
@@ -21,7 +22,7 @@ class SpeakerSim:
         self.proc = subprocess.Popen(
             ["uv", "run", "--project", str(INDEX_DIR), "python", str(WORKER)],
             cwd=INDEX_DIR, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1)
         assert self.proc.stdout.readline().strip() == "ready"
         self.cache: dict[str, np.ndarray] = {}
 
@@ -33,7 +34,8 @@ class SpeakerSim:
         return self.cache[key]
 
     def embed_audio(self, a: np.ndarray, sr: int) -> np.ndarray:
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete_on_close=False) as f:
+            f.close()
             sf.write(f.name, a, sr)
             self.proc.stdin.write(f.name + "\n")
             return np.array(json.loads(self.proc.stdout.readline()))

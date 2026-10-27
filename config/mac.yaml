@@ -1,0 +1,5 @@
+# Mac 上的本机路径。~ 会展开成用户目录。
+game: ~/Windows/games/WHITE ALBUM2_Chs
+tools: ~/codes/github.com/thalesfu/gameresource/acg/白色相簿2/Dev/tools
+indextts: ~/codes/github.com/index-tts/index-tts
+cover: ~/Library/Mobile Documents/com~apple~CloudDocs/Calibre 书库/九户史明/白色相簿2 剧本全集 (2528)/cover.jpg

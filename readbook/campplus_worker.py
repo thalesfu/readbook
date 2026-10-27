@@ -16,6 +16,7 @@ from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
 model = CAMPPlus(feat_dim=80, embedding_size=192)
 model.load_state_dict(torch.load("checkpoints_2/hf_cache/campplus_cn_common.bin", map_location="cpu"))
 model.eval()
+sys.stdin.reconfigure(encoding="utf-8")  # 路径里有中文；Windows 默认按 GBK 读
 print("ready", flush=True)
 for line in sys.stdin:
     a, sr = sf.read(line.strip(), dtype="float32")

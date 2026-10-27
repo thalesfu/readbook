@@ -102,7 +102,7 @@ def ask_claude(prompt: str, model: str | None = None) -> dict:
            "--json-schema", json.dumps(SCHEMA, ensure_ascii=False)]
     if model:
         cmd += ["--model", model]
-    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", check=True)
     out = json.loads(res.stdout)
     data = out.get("structured_output") or json.loads(out["result"])
     return data

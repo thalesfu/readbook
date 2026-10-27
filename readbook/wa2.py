@@ -7,10 +7,9 @@
 import re
 import sys
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
-GAME = Path("~/Windows/games/WHITE ALBUM2_Chs").expanduser()
-TOOLS = Path("~/codes/github.com/thalesfu/gameresource/acg/白色相簿2/Dev/tools").expanduser()
+from .config import GAME, TOOLS
+
 sys.path.insert(0, str(TOOLS))
 
 from daily import ROUTES, walk  # noqa: E402
@@ -73,6 +72,7 @@ def load_day(route: str, date: tuple[int, int, int]) -> list[Line]:
 if __name__ == "__main__":
     import json
 
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows 上管道默认是 GBK
     route, day = sys.argv[1], tuple(int(x) for x in sys.argv[2].split("-"))
     for line in load_day(route, day):
         print(json.dumps(asdict(line), ensure_ascii=False))

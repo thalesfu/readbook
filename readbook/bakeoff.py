@@ -30,6 +30,7 @@ import soundfile as sf
 import yaml
 
 from . import qc, wa2
+from .config import INDEX_DIR
 from .scriptize import load_cast
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT, read_jsonl
@@ -46,7 +47,6 @@ REF_ROUTES = ("01 第二部-共通", "02 第二部-雪菜线", "07 第三部-共
 ZH_RATE = 4.2  # 普通话有声书的常见语速（字/秒），按角色原声的快慢再调
 VOXCPM = "mlx-community/VoxCPM2-bf16"
 QWEN_BASE = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
-INDEX_DIR = Path("~/codes/github.com/index-tts/index-tts").expanduser()
 
 
 def sample_rows() -> list[dict]:

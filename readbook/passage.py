@@ -59,7 +59,7 @@ def main(name: str, route: str, day: str, from_sid: str):
     from mlx_audio.tts.utils import load_model
 
     model = None
-    log = json.loads((out / "qc.json").read_text()) if (out / "qc.json").exists() else {}
+    log = json.loads((out / "qc.json").read_text(encoding="utf-8")) if (out / "qc.json").exists() else {}
     for r in rows:
         f = wav / f"{r['idx']:04d}.wav"
         text = tts_text(r, lex)

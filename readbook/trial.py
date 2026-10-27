@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from . import wa2
+from .config import COVER
 from .scriptize import load_cast, scriptize
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -90,8 +91,6 @@ VERSIONS = {  # 版本 → 混音时是否做内心后期
 }
 TITLES = {"02-2011-01-01": "2011-01-01 周六（雪菜线·新年）",
           "07-2013-01-26": "2013-01-26 周六（第三部·共通）"}
-COVER = Path("~/Library/Mobile Documents/com~apple~CloudDocs/Calibre 书库/九户史明/"
-             "白色相簿2 剧本全集 (2528)/cover.jpg").expanduser()
 
 
 def export_orig(rows: list[dict], out: Path):
