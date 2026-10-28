@@ -180,21 +180,41 @@ def real_embeddings(sp: SpeakerSim, cast: dict, names: list[str]) -> dict[str, n
     if missing:
         vp = VoicePak()
         for n in missing:
-            code = cast["characters"][n]["code"]
-            files = sorted(f for f in vp.index if f.endswith(f"_{code}.OGG"))
-            random.Random(REAL_SEED).shuffle(files)
-            embs = []
-            for f in files:
-                a = vp.audio(f)
-                if 1.5 <= len(a) / SR <= 15:
-                    embs.append(sp.embed_audio(a, SR))
-                if len(embs) >= REAL_N:
-                    break
+            embs = [sp.embed_audio(a, SR) for _, a in real_clips(vp, cast["characters"][n]["code"])]
             have[n] = np.array(embs)
             print(n, "原声", len(embs), "句", flush=True)
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez(cache, **have)
     return {n: have[n] for n in names}
+
+
+def real_pitch(cast: dict, names: list[str]) -> dict[str, np.ndarray]:
+    """每个角色同一批 REAL_N 句原声的音高（qc.f0_median，Hz；测不出的不计），缓存在 out/eval/real-pitch.json。"""
+    cache = OUT / "eval" / "real-pitch.json"
+    have = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else {}
+    missing = [n for n in names if n not in have]
+    if missing:
+        vp = VoicePak()
+        for n in missing:
+            have[n] = [f for _, a in real_clips(vp, cast["characters"][n]["code"]) if (f := qc.f0_median(a))]
+            print(n, "原声音高", len(have[n]), "句", flush=True)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(have, ensure_ascii=False), encoding="utf-8")
+    return {n: np.array(have[n]) for n in names}
+
+
+def real_clips(vp: VoicePak, code: str):
+    """(语音文件, 音频)：按固定种子随机取的 REAL_N 句 1.5–15 秒原声，音色门槛和原声分布都用这一批。"""
+    files = sorted(f for f in vp.index if f.endswith(f"_{code}.OGG"))
+    random.Random(REAL_SEED).shuffle(files)
+    k = 0
+    for f in files:
+        a = vp.audio(f)
+        if 1.5 <= len(a) / SR <= 15:
+            yield f, a
+            k += 1
+        if k >= REAL_N:
+            break
 
 
 def voice_gate(E: np.ndarray) -> tuple[np.ndarray, dict]:

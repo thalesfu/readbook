@@ -71,6 +71,41 @@ def max_jump(a: np.ndarray, target_f0: float, sr: int = SR) -> float:
     return max(fs) / target_f0 if fs else 1.0
 
 
+def jitter(a: np.ndarray, sr: int = SR) -> float | None:
+    """音高抖动（音分），抓合成的颤音（16 号票对比文档的算法）：
+
+    pyin 每 10 毫秒估一个音高换成音分，只看连续有声不短于 0.3 秒的段，减掉 0.3 秒的滑动平均（去掉语调起伏），
+    丢掉两头各半个窗口和 |残差| ≥ 300 音分的帧（多半是倍频误判），剩下的残差取稳健标准差（1.4826×MAD）。
+    会把正常的语调起伏也算进一部分，只拿来比同一个人的原声和合成。测不出（没有够长的有声段）返回 None。
+    17 号票试听：它和耳机里听到的电子颤音对不上（三个春希锚点上正好排反），不再用来挑锚点。
+    """
+    import librosa
+
+    a = a.mean(axis=1) if a.ndim > 1 else a
+    a = librosa.resample(a, orig_sr=sr, target_sr=16000)
+    f0, voiced, _ = librosa.pyin(a, fmin=65, fmax=500, sr=16000, frame_length=1024, hop_length=160)
+    k = 30
+    res, i, n = [], 0, len(f0)
+    while i < n:
+        if not voiced[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and voiced[j]:
+            j += 1
+        if j - i >= k:
+            c = 1200 * np.log2(f0[i:j] / 100)
+            r = (c - np.convolve(c, np.ones(k) / k, "same"))[k // 2: -k // 2]
+            r = r[np.abs(r) < 300]
+            if len(r) >= 16:
+                res.append(r)
+        i = j
+    if not res:
+        return None
+    r = np.concatenate(res)
+    return float(1.4826 * np.median(np.abs(r - np.median(r))))
+
+
 def judge(a: np.ndarray, text: str, target_f0: float, target_rate: float) -> tuple[float, dict]:
     """偏差分数（越小越好）和明细。音高按对数偏差，语速按比例偏差。"""
     f, r = f0_median(a), rate(a, text)
