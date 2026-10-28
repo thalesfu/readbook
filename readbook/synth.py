@@ -51,8 +51,9 @@ class Voice:
 
 
 def tts_text(row: dict, lexicon: dict[str, str]) -> str:
-    """台词去掉外层引号；全角字母数字转半角；套读音表；换行合并。"""
-    t = re.sub(r"[Ａ-Ｚａ-ｚ０-９]+", lambda m: unicodedata.normalize("NFKC", m.group()),
+    """台词去掉外层引号；全角字母数字转半角（夹在中间的全角空格一起转，否则 TTS 会把它读成怪音，
+    比如「Ｈａｐｐｙ　Ｎｅｗｙｅａｒ」）；套读音表；换行合并。"""
+    t = re.sub(r"[Ａ-Ｚａ-ｚ０-９]+(?:　[Ａ-Ｚａ-ｚ０-９]+)*", lambda m: unicodedata.normalize("NFKC", m.group()),
                row["text"].replace("\n", ""))
     if row["type"] == "台词":
         t = re.sub(r"^[“‘](.*)[”’]$", r"\1", t)
