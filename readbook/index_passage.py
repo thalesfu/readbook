@@ -4,10 +4,14 @@
     uv run python -m readbook.index_passage 2 "2010-11-25 〈2002〉"
     uv run python -m readbook.index_passage 2.5-plain 小样      # 对照：同样的句子不给情绪
     uv run python -m readbook.index_passage 2.5-ref 小样        # 本人有该情绪的定妆音就拿它当情感参考
+    uv run python -m readbook.index_passage 2.5-原声平均锚点 小样  # 16 号票：用更像原声的那个锚点
     uv run python -m readbook.index_passage stats 小样 2 2.5      # 候选级的"情绪 × 音色"表
+    uv run python -m readbook.index_passage pair 小样 2.5 2.5-原声平均锚点   # 两版同一句同一种子的候选逐个配对
 
 - 音色：每个角色只用音色锚点（voices.yaml 的「平常」）。IndexTTS 只取参考的前 15 秒，超长的
-  在 15 秒内最后一个停顿处截断（anchor_clip）；
+  在 15 秒内最后一个停顿处截断（anchor_clip）。-原声平均锚点版只换这一项：rawanchor 用原声平均版重做的锚点
+  比旧定妆音更像原声的角色（这次只有春希）换成新锚点，情感参考、情感向量、质检目标都不变；挑选时"像锚点"
+  也改成和所用的锚点比；
 - 情绪：EMOTION 表，2.0 和 2.5 共用。「平常」不给向量；讲述模式（叙述者的旁白和心里话、情绪平常）
   拿叙述者自己的讲述定妆音当情感参考，音色仍取锚点；
 - 每句按固定种子生成 TAKES 个候选，全部留着做统计；读入时切掉首尾静音（read_take）。挑选按混合版锚点版的做法顺序过一遍：
@@ -58,6 +62,24 @@ EMOTION = {
 }
 EMOTION["激动"], EMOTION["低落"] = EMOTION["兴奋"], EMOTION["难过"]
 EMO_ALPHA = 1.0  # 全局强度旋钮；强弱已经写进向量
+RAWAVG = "原声平均锚点"  # 16 号票的版本后缀
+
+
+def speaker_anchors(variant: str, voices: dict) -> dict[str, Path]:
+    """角色 → 整段音色锚点：默认是 voices.yaml 的「平常」；-原声平均锚点版里，rawanchor 重做的锚点
+    比旧定妆音更像原声的角色换成新的（rawanchor.adopted），其余不变。"""
+    old = {n: Path(v["平常"]["zh_audio"]) for n, v in voices.items()}
+    if variant == RAWAVG:
+        from .rawanchor import adopted
+
+        return {**old, **{n: p for n, p in adopted().items() if n in old}}
+    return old
+
+
+def clipped_anchors(variant: str, voices: dict) -> dict[str, Path]:
+    """IndexTTS 实际用的说话人参考（前 15 秒）。"""
+    sub = f"anchors-{variant}" if variant == RAWAVG else "anchors"
+    return {n: anchor_clip(p, WORK / sub / f"{n}.wav") for n, p in speaker_anchors(variant, voices).items()}
 
 
 def anchor_clip(src: Path, dst: Path) -> Path:
@@ -103,7 +125,7 @@ def build(version: str, name: str):
     cast = load_cast(BOOK / "cast.yaml")
     voices = load_voices()
     lex = load_yaml(BOOK / "lexicon.yaml")
-    anchors = {n: anchor_clip(Path(v["平常"]["zh_audio"]), WORK / "anchors" / f"{n}.wav") for n, v in voices.items()}
+    anchors = clipped_anchors(variant, voices)
     out = WORK / version / name
     raw = out / "raw"
     raw.mkdir(parents=True, exist_ok=True)
@@ -132,12 +154,14 @@ def build(version: str, name: str):
                    cwd=INDEX_DIR, env=env, check=True)
     if plain:
         return
-    pick(version, name, rows, cast, voices, anchors, lex, mood_ref)
+    pick(version, name, rows, cast, voices, anchors, lex, mood_ref, speaker_anchors(variant, voices))
 
 
-def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False):
+def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=None):
+    """full：挑选时"像锚点"和谁比（整段锚点），默认是 voices.yaml 的「平常」。"""
     from .speaker import SpeakerSim
 
+    full = full or speaker_anchors("", voices)
     out = WORK / version / name
     raw, wav = out / "raw", out / "wav"
     wav.mkdir(parents=True, exist_ok=True)
@@ -152,7 +176,7 @@ def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False):
             sf.write(f, np.zeros(int(0.8 * SR), dtype=np.float32), SR)
             continue
         p = plan_row(r, cast, voices, anchors, mood_ref)
-        e_anc = sp.embed(voices[r["speaker"]]["平常"]["zh_audio"])
+        e_anc = sp.embed(full[r["speaker"]])
         cands = []
         for k in range(TAKES):
             a = read_take(raw / f"{r['idx']:04d}-{k}.wav")
@@ -203,7 +227,7 @@ def stats(name: str, versions: list[str]):
     anchors = {n: WORK / "anchors" / f"{n}.wav" for n in voices}
     sp = SpeakerSim()
     gates = {n: voice_gate(E) for n, E in real_embeddings(sp, cast, list(voices)).items()}
-    e_anc = {n: sp.embed(v["平常"]["zh_audio"]) for n, v in voices.items()}
+    e_anc = {v: {n: sp.embed(f) for n, f in speaker_anchors(v.partition("-")[2], voices).items()} for v in versions}
 
     idle = {}  # 版本 → 尾部空转（切掉的静音）超过 1 秒的候选数、候选总数
 
@@ -218,7 +242,7 @@ def stats(name: str, versions: list[str]):
             if qc.speech_seconds(a) < SHORT:
                 continue
             e, n = sp.embed_audio(a, SR), rows[i]["speaker"]
-            out.setdefault(i, []).append((float(e @ gates[n][0]), float(e @ e_anc[n])))
+            out.setdefault(i, []).append((float(e @ gates[n][0]), float(e @ e_anc[version][n])))
         return out
 
     def group(i, version):
@@ -245,7 +269,8 @@ def stats(name: str, versions: list[str]):
             lines.append(f"| {g} | {how} | {len(ss)} | {sum(s >= gate for s in real)}/{len(ss)} "
                          f"| {np.median(real):.2f} | {np.median(anc):.2f} | {sum(s >= SIM_LINE for s in anc)}/{len(ss)} |")
         lines.append("")
-        plain = scored.get(f"{v.split('-')[0]}-plain")  # -ref 版和同模型的对照组配对：加情绪的句子是同一批
+        # -ref 版和同模型的对照组配对：加情绪的句子是同一批；换了说话人参考的版本不能和它配
+        plain = scored.get(f"{v.split('-')[0]}-plain") if v.partition("-")[2] in ("", "ref") else None
         if plain:
             lines += [f"### {v}：加情绪 vs 不加（同一句配对，像原声 中位）", "",
                       "| 情绪 | 句数 | 不加 | 加 | 差 | 过门槛 不加 → 加 |", "|---|---|---|---|---|---|"]
@@ -283,8 +308,97 @@ def stats(name: str, versions: list[str]):
     print(md)
 
 
+def pair(name: str, a: str, b: str):
+    """两版同一句、同一种子的候选逐个配对（不经挑选）。两版只差说话人参考时，差别就是参考带来的：
+    像原声、过门槛、认人（离谁的原声中心最近）、和最像的另一个人差多少、音高、变速前的语速；
+    再加挑选后的结果（用了几个候选、要拉快多少）和生成速度。"""
+    from .evaluate import SHORT, real_embeddings, voice_gate
+    from .speaker import SpeakerSim
+
+    rows = {r["idx"]: r for r in load_rows(name, None, None, None)}
+    cast = load_cast(BOOK / "cast.yaml")
+    voices = load_voices()
+    lex = load_yaml(BOOK / "lexicon.yaml")
+    anchors = clipped_anchors("", voices)  # 只用来取情绪的做法（how），两版一样
+    sp = SpeakerSim()
+    gates = {n: voice_gate(E) for n, E in real_embeddings(sp, cast, list(voices)).items()}
+
+    def take(f):
+        r = rows[int(f.stem.split("-")[0])]
+        x = read_take(f)
+        out = {"sim": None, "near": None, "gap": None, "f0": qc.f0_median(x), "rate": qc.rate(x, tts_text(r, lex))}
+        if qc.speech_seconds(x) >= SHORT:
+            e, n = sp.embed_audio(x, SR), r["speaker"]
+            sims = {m: float(e @ g[0]) for m, g in gates.items()}
+            out.update(sim=sims[n], near=max(sims, key=sims.get) == n,
+                       gap=sims[n] - max(v for m, v in sims.items() if m != n))
+        return out
+
+    data = {v: {f.stem: take(f) for f in sorted((WORK / v / name / "raw").glob("*-*.wav"))} for v in (a, b)}
+    keys = sorted(set(data[a]) & set(data[b]))
+
+    def label(k):
+        r = rows[int(k.split("-")[0])]
+        g = r["speaker"] if r["type"] == "台词" else f"{r['speaker']}·讲述"
+        return g, plan_row(r, cast, voices, anchors)["how"]
+
+    def med(v, ks, key, fmt):
+        xs = [data[v][k][key] for k in ks if data[v][k][key] is not None]
+        return format(np.median(xs), fmt) if xs else "—"
+
+    def line(title, ks):
+        both = [k for k in ks if data[a][k]["sim"] is not None and data[b][k]["sim"] is not None]
+        gate = lambda k: gates[rows[int(k.split("-")[0])]["speaker"]][1]["center_p5"]  # noqa: E731
+        diff = np.median([data[b][k]["sim"] - data[a][k]["sim"] for k in both]) if both else None
+        return (f"| {title} | {len(ks)} | {med(a, both, 'sim', '.2f')} → {med(b, both, 'sim', '.2f')} "
+                f"| {f'{diff:+.2f}' if diff is not None else '—'} "
+                f"| {sum(data[a][k]['sim'] >= gate(k) for k in both)}/{len(both)} → "
+                f"{sum(data[b][k]['sim'] >= gate(k) for k in both)}/{len(both)} "
+                f"| {sum(data[a][k]['near'] for k in both)}/{len(both)} → {sum(data[b][k]['near'] for k in both)}/{len(both)} "
+                f"| {med(a, both, 'gap', '+.2f')} → {med(b, both, 'gap', '+.2f')} "
+                f"| {med(a, ks, 'f0', '.0f')} → {med(b, ks, 'f0', '.0f')} "
+                f"| {med(a, ks, 'rate', '.2f')} → {med(b, ks, 'rate', '.2f')} |")
+
+    head = ["| {} | 候选 | 像原声 中位 | 配对差 中位 | 过门槛 | 认人·原声中心 | 像自己 − 最像的别人 中位 "
+            "| 音高 Hz 中位 | 语速 字/秒 中位（变速前） |", "|---|---|---|---|---|---|---|---|---|"]
+    lines = [f"# {name}：{a} → {b}，候选逐个配对", "",
+             f"同一句、同一种子的候选一一配对，每句 {TAKES} 个全部计入，不经挑选。像原声和过门槛只算去掉首尾静音后 "
+             f"≥{SHORT} 秒的候选（两版都够长的才配）；音高、语速算全部候选（语速要 ≥4 个字）。语速是生成出来的原样，"
+             "还没有拉回目标。", "", "## 按组", "", head[0].format("组"), head[1]]
+    groups = {}
+    for k in keys:
+        g, how = label(k)
+        groups.setdefault(g, []).append(k)
+        groups.setdefault((g, how), []).append(k)
+    lines += [line(g, ks) for g, ks in groups.items() if isinstance(g, str)]
+    lines += [line("合计", keys), "", "## 按组和情绪", "", head[0].format("组 · 情绪"), head[1]]
+    lines += [line(f"{g[0]} · {g[1]}", ks) for g, ks in sorted((x for x in groups.items() if isinstance(x[0], tuple)),
+                                                                key=lambda x: (x[0][0], -len(x[1])))]
+
+    lines += ["", "## 挑选后和速度", "",
+              "| 版本 | 平均每句用几个候选 | 挑中的变速前语速 中位 | 要拉快的句子（变速前 <目标 0.85 倍） | 单个候选 实时率 | 每字（用到的候选） | 全书 |",
+              "|---|---|---|---|---|---|---|"]
+    for v in (a, b):
+        qcj = json.loads((WORK / v / name / "qc.json").read_text(encoding="utf-8"))
+        slow = sum(1 for i, m in qcj.items() if m.get("rate") and
+                   m["rate"] < 0.85 * plan_row(rows[int(i)], cast, voices, anchors)["rate"])
+        t = [json.loads(x) for x in (WORK / v / name / "raw" / "timing.jsonl").read_text(encoding="utf-8").splitlines()]
+        gen = [x for x in t if "out" in x]
+        used_chars = sum(len(qc.SPOKEN.findall(rows[int(i)]["text"])) for i in qcj)
+        per_char = sum(m["secs"] for m in qcj.values()) / used_chars
+        lines.append(f"| {v} | {np.mean([m['tries'] for m in qcj.values()]):.2f} "
+                     f"| {np.median([m['rate'] for m in qcj.values() if m.get('rate')]):.2f} | {slow}/{len(qcj)} "
+                     f"| {sum(x['secs'] for x in gen) / sum(x['dur'] for x in gen):.2f} | {per_char:.2f} 秒 "
+                     f"| {per_char * BOOK_CHARS / 86400:.1f} 天 |")
+    md = WORK / f"{name}-配对-{a}-{b}.md"
+    md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    print(md)
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "stats":
         stats(sys.argv[2], sys.argv[3:])
+    elif sys.argv[1] == "pair":
+        pair(*sys.argv[2:5])
     else:
         build(sys.argv[1], sys.argv[2])

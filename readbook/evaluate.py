@@ -2,6 +2,7 @@
 
     uv run python -m readbook.evaluate 小样 out/bakeoff/qwen-anchor
     uv run python -m readbook.evaluate 2002 "books/wa2/baseline/2010-11-25 〈2002〉-混合版.mp3"
+    uv run python -m readbook.evaluate 小样 <MP3> --锚点 春希=books/wa2/trials/rawavg-anchor/锚点/春希.wav
 
 输入两种：
 - 逐句 wav 的目录（<idx 四位>.wav，48k 干声，bakeoff / passage 的输出），结果写在这个目录旁边；
@@ -13,7 +14,7 @@
 指标（技术报告第七节，05 号票补强）：
 - 像原声：和本人日语原声嵌入中心的 CAM++ 相似度。原声从语音包里按固定种子随机取 300 句（1.5–15 秒），
   向量缓存在 out/eval/real.npz；
-- 像锚点：和音色锚点（books/wa2/voices/<名字>/平常.wav）的相似度；
+- 像锚点：和音色锚点（books/wa2/voices/<名字>/平常.wav，--锚点 <名字>=<wav> 可以换掉某个人的，能写多个）的相似度；
 - 音色门槛：本人原声和原声中心相似度的 P5（和逐句分数同一尺度），见 voice_gate；
 - 认人准确率：离四个人的锚点哪个最近；另附按原声中心算的；
 - 不到 1.5 秒的句子单独统计：声纹模型在短句上测不准；
@@ -287,7 +288,7 @@ def ratio(hit: int, n: int) -> str:
 
 
 def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gates: dict,
-           anchors: dict) -> str:
+           anchors: dict, swap: dict[str, Path] | None = None) -> str:
     names = list(voices)
     voiced = [r for r in recs if r["speaker"] in names]
     groups = [g for n in names for g in (n, f"{n}·讲述") if any(group(r) == g for r in voiced)]
@@ -296,8 +297,10 @@ def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gate
     gate = {n: gates[n][1]["center_p5"] for n in names}
     out = [f"# {src.stem} 指标", "",
            f"- 片段：{title}",
-           f"- 版本：`{(src.resolve().relative_to(ROOT) if src.resolve().is_relative_to(ROOT) else src).as_posix()}`",
+           f"- 版本：`{rel(src)}`",
            f"- 音频：{how}",
+           *([f"- 锚点：`{rel(VOICES)}/<名字>/平常.wav`；" + "，".join(f"{n}换成 `{rel(p)}`" for n, p in swap.items())]
+             if swap else []),
            f"- 生成：{date.today()}，`uv run python -m readbook.evaluate`",
            "- 相似度都是 CAM++ 余弦相似度。像原声＝和本人日语原声嵌入中心比；像锚点＝和音色锚点（平常）比。",
            f"- 不到 {SHORT} 秒的句子（去掉首尾静音后）声纹测不准，单列，不进主表。", ""]
@@ -391,11 +394,16 @@ def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gate
     return "\n".join(out) + "\n"
 
 
+def rel(p: Path) -> str:
+    return (p.resolve().relative_to(ROOT) if p.resolve().is_relative_to(ROOT) else p).as_posix()
+
+
 def cell(text: str) -> str:
     return text.replace("\n", " ").replace("|", "｜")
 
 
-def main(passage: str, src: str, script: str | None = None):
+def main(passage: str, src: str, script: str | None = None, swap: dict[str, Path] | None = None):
+    """swap：{名字: wav}，换掉这些人的音色锚点（像锚点、认人·锚点跟着变）。"""
     title, load_rows = PASSAGES[passage]
     src = Path(src)
     rows = load_rows()
@@ -420,13 +428,21 @@ def main(passage: str, src: str, script: str | None = None):
     names = list(voices)
     real = real_embeddings(sp, cast, names)
     gates = {n: voice_gate(E) for n, E in real.items()}
-    anchors = {n: sp.embed(VOICES / n / "平常.wav") for n in names}
+    anchors = {n: sp.embed((swap or {}).get(n, VOICES / n / "平常.wav")) for n in names}
     recs = evaluate(rows, audio, starts, lex, voices, gates, anchors, sp)
     write_jsonl(stem.with_name(stem.name + "-逐句.jsonl"), recs)
     md = stem.with_name(stem.name + ".md")
-    md.write_text(report(title, src, how, recs, voices, gates, anchors), encoding="utf-8", newline="\n")
+    md.write_text(report(title, src, how, recs, voices, gates, anchors, swap), encoding="utf-8", newline="\n")
     print(md)
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:4])
+    args, swap = [], {}
+    it = iter(sys.argv[1:])
+    for a in it:
+        if a == "--锚点":
+            n, _, p = next(it).partition("=")
+            swap[n] = Path(p)
+        else:
+            args.append(a)
+    main(*args[:3], swap=swap)
