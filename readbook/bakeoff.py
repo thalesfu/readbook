@@ -247,7 +247,7 @@ def mood_ref(row: dict, refs: dict, cast: dict) -> dict:
 
     n = row["speaker"]
     if n == cast["narrator"] and row["type"] in ("旁白", "心理活动"):
-        ref = refs[n][moods.NARRATION]
+        ref = refs[n].get(moods.NARRATION) or refs[n]["平常"]  # 原声版没有讲述，用锚点
     else:
         m = moods.resolve(row.get("mood", "平常"), cast["characters"][n]["tier"], set(refs[n]["_have"]))
         ref = refs[n].get(m) or refs[n]["平常"]
@@ -402,16 +402,19 @@ def synth_qc(model, text: str, ref: dict, tries=5, temperature=0.6, jump=1.45) -
     return finish(cands, text, ref)
 
 
-def synth_anchor(model, sp, text: str, ref: dict, tries=6) -> tuple[np.ndarray, dict]:
-    e_anc = sp.embed(ref["anchor"])
+def synth_anchor(model, sp, text: str, ref: dict, tries=6, target: np.ndarray | None = None,
+                 line: float = SIM_LINE) -> tuple[np.ndarray, dict]:
+    """逐句多一道 CAM++ 门槛：默认和锚点比、≥SIM_LINE；原声版的锚点是日语原声，改成和原声中心比、
+    过音色门槛（target、line 由调用方给）。"""
+    e_anc = sp.embed(ref["anchor"]) if target is None else target
     cands = []
     for a in qwen_takes(model, text, ref, tries, 0.6):
         s = sp.sim(sp.embed_audio(a, SR), e_anc) if len(a) > SR // 2 else 1.0  # 太短的测不准
         cands.append((s, a))
-        if s >= SIM_LINE and ok(a, text, ref, 1.45):
+        if s >= line and ok(a, text, ref, 1.45):
             break
     # 先看音色：过线的里面再按音高、语速挑；都没过线就取最像锚点的
-    passed = [a for s, a in cands if s >= SIM_LINE]
+    passed = [a for s, a in cands if s >= line]
     if passed:
         a, m = finish(passed, text, ref)
     else:
@@ -462,13 +465,39 @@ class TorchQwen:
         talker.generate = windowed
         self.prompts = {}
 
-    def takes(self, text: str, ref: dict, n: int, temperature: float | None) -> list[np.ndarray]:
-        key = ref["zh_audio"]
+    def prompt(self, ref: dict) -> list:
+        """参考音编码成复刻提示并缓存。ref["xvec"] 为真时用官方的 x_vector_only_mode：只取说话人向量，
+        参考码和逐字稿不进上下文（07 号票的原声向量版）；再带 spk_files 时，说话人向量取这些原声
+        各自向量的平均（原声平均版）。"""
+        key = (ref["zh_audio"], ref.get("xvec", False), tuple(ref.get("spk_files", ())))
         if key not in self.prompts:
-            self.prompts[key] = self.tts.create_voice_clone_prompt(ref_audio=key, ref_text=ref["zh_text"])
+            if key[2]:
+                from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+
+                self.prompts[key] = [VoiceClonePromptItem(ref_code=None, ref_spk_embedding=self.mean_xvec(key[2]),
+                                                          x_vector_only_mode=True, icl_mode=False)]
+            else:
+                self.prompts[key] = self.tts.create_voice_clone_prompt(
+                    ref_audio=key[0], ref_text=ref["zh_text"], x_vector_only_mode=key[1])
+        return self.prompts[key]
+
+    def mean_xvec(self, files: tuple[str, ...]):
+        """语音包里这些原声的说话人向量取平均，长度缩放到单句向量长度的平均值。"""
+        import librosa
+        import torch
+
+        vp = VoicePak()
+        sr = self.tts.model.speaker_encoder_sample_rate
+        embs = [self.tts.model.extract_speaker_embedding(
+            audio=librosa.resample(vp.audio(f), orig_sr=SR, target_sr=sr), sr=sr) for f in files]
+        E = torch.stack([e.float() for e in embs])
+        m = E.mean(0)
+        return (m / m.norm() * E.norm(dim=1).mean()).to(embs[0].dtype)
+
+    def takes(self, text: str, ref: dict, n: int, temperature: float | None) -> list[np.ndarray]:
         temp = {"temperature": temperature, "subtalker_temperature": temperature} if temperature else {}
         wavs, sr = self.tts.generate_voice_clone(
-            text=[text] * n, language="Chinese", voice_clone_prompt=self.prompts[key], non_streaming_mode=True,
+            text=[text] * n, language="Chinese", voice_clone_prompt=self.prompt(ref), non_streaming_mode=True,
             top_k=50, subtalker_top_k=50, top_p=1.0, subtalker_top_p=1.0, **temp,
             max_new_tokens=int(12.5 * (3.5 + 0.5 * len(qc.SPOKEN.findall(text)))))
         return [to48k(np.asarray(w, dtype=np.float32), sr) for w in wavs]

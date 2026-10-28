@@ -7,7 +7,13 @@
 - Qwen3-TTS Base，温度 0.6，句内变调上限 1.45，最多 5 次，语速拉回目标的 0.85–1.2 倍。
 Mac 上用 mlx-audio 版，Windows 上用官方 PyTorch 版（见 bakeoff.TorchQwen）。
 
-    uv run python -m readbook.passage 小样
+07 号票的三个对照版本，参考都换成日语原声（见 rawref），其余照旧；依绪、武也的逐句门槛改成和本人原声中心比、
+过音色门槛。产物在 out/passage/<名字>-<版本>/。
+- --原声版：带文本复刻，参考是原声加日文逐字稿（有日语口音，不可用）；
+- --原声向量版：只取拼好的那段原声的说话人向量，参考码和逐字稿不进上下文；
+- --原声平均版：说话人向量取几十句原声的平均。
+
+    uv run python -m readbook.passage 小样 [--原声版|--原声向量版|--原声平均版]
     uv run python -m readbook.passage "2010-11-25 〈2002〉" "01 第二部-共通" 2010-11-25 2002
 """
 
@@ -30,6 +36,7 @@ VOICES = BOOK / "voices"
 # 说话人 → 参考来源
 VOICE_SOURCE = {"春希": "moods", "雪菜": "single", "依绪": "anchor", "武也": "anchor"}
 TYPE = {"旁白": "旁白", "台词": "台词", "心理活动": "心里话"}
+VARIANTS = ("混合版", "原声版", "原声向量版", "原声平均版")
 
 
 def load_voices() -> dict:
@@ -38,6 +45,19 @@ def load_voices() -> dict:
     return {n: {m: {"mood": m, "zh_audio": str(VOICES / v["audio"]), "zh_text": v["text"],
                     "f0": v["f0"], "rate": v["rate"]} for m, v in c["定妆音"].items()}
             for n, c in data.items()}
+
+
+def load_refs(variant: str) -> dict:
+    from . import rawref
+
+    return load_voices() if variant == "混合版" else rawref.load(variant)
+
+
+def variant_arg(args: list[str]) -> tuple[list[str], str]:
+    """命令行里的 --<版本>；没有就是混合版。"""
+    flags = [a[2:] for a in args if a.startswith("--")]
+    assert all(f in VARIANTS for f in flags), f"版本只能是 {VARIANTS}"
+    return [a for a in args if not a.startswith("--")], flags[0] if flags else "混合版"
 
 
 def pick_ref(row, cast, voices):
@@ -68,16 +88,28 @@ def load_rows(name: str, route: str | None, day: str | None, from_sid: str | Non
     return read_jsonl(script)
 
 
-def main(name: str, route: str | None = None, day: str | None = None, from_sid: str | None = None):
+def raw_gates(sp) -> dict:
+    """原声版的逐句门槛：{角色: (原声嵌入中心, 音色门槛)}，和 evaluate 同一套。"""
+    from .evaluate import real_embeddings, voice_gate
+
+    cast = load_cast(BOOK / "cast.yaml")
+    real = real_embeddings(sp, cast, [n for n, s in VOICE_SOURCE.items() if s == "anchor"])
+    return {n: (c, s["center_p5"]) for n, (c, s) in ((n, voice_gate(E)) for n, E in real.items())}
+
+
+def main(name: str, route: str | None = None, day: str | None = None, from_sid: str | None = None,
+         variant: str = "混合版"):
     rows = load_rows(name, route, day, from_sid)
     cast = load_cast(BOOK / "cast.yaml")
-    voices = load_voices()
+    voices = load_refs(variant)
+    raw = variant != "混合版"
     lex = load_yaml(BOOK / "lexicon.yaml")
-    out = OUT / "passage" / name
+    label = f"{name}-{variant}" if raw else name
+    out = OUT / "passage" / label
     wav = out / "wav"
     wav.mkdir(parents=True, exist_ok=True)
 
-    model = sp = None
+    model = sp = gates = None
     log = json.loads((out / "qc.json").read_text(encoding="utf-8")) if (out / "qc.json").exists() else {}
     for r in rows:
         f = wav / f"{r['idx']:04d}.wav"
@@ -95,7 +127,12 @@ def main(name: str, route: str | None = None, day: str | None = None, from_sid: 
                 from .speaker import SpeakerSim
 
                 sp = SpeakerSim()
-            a, m = synth_anchor(model, sp, text, ref)
+            if raw:
+                gates = gates or raw_gates(sp)
+                a, m = synth_anchor(model, sp, text, ref, target=gates[r["speaker"]][0],
+                                    line=gates[r["speaker"]][1])
+            else:
+                a, m = synth_anchor(model, sp, text, ref)
         else:
             a, m = synth_qc(model, text, ref)
         m.update(ref=ref["mood"], secs=round(time.perf_counter() - t, 2), dur=round(len(a) / SR, 2))
@@ -104,7 +141,7 @@ def main(name: str, route: str | None = None, day: str | None = None, from_sid: 
         print(r["idx"], log[str(r["idx"])], flush=True)
         (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
 
-    mix(name, rows, cast, wav, out)
+    mix(label, rows, cast, wav, out)
 
 
 def mix(name, rows, cast, wav, out):
@@ -138,4 +175,5 @@ def write_table(name, rows, marks, out):
 
 
 if __name__ == "__main__":
-    main(*sys.argv[1:5])
+    args, variant = variant_arg(sys.argv[1:])
+    main(*args[:4], variant=variant)
