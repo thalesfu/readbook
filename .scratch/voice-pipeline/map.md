@@ -31,6 +31,8 @@ Label: wayfinder:map
 
 <!-- 每张关掉的票一行：标题链接 + 一句结论 -->
 
+- [IndexTTS-2.5 的情绪会不会带偏音色](issues/10-indextts25-prototype.md)：**选 2.5**，用户试听情绪比 2.0 到位；按剧本情绪逐句给情感向量，基本不带偏音色（同一句加情绪和不加配对，像原声差 −0.02～+0.10），成品过音色门槛小样 30/31、〈2002〉47/47（混合版 20/30、33/43），认人 100%；例外是「轻声」向量把春希的音高抬了 12–28%，改用他的轻声定妆音（02 号票的建议）能拉回音高，但用户试听整体不如向量版，要另调向量；实测每字 0.44 秒，全书约 8.5 天（混合版 9.6 天）；读音略差，「雪菜」的声调常读错；产物和对比在 `books/wa2/trials/indextts/`，用 `readbook.index_passage 2.5 小样|"2010-11-25 〈2002〉"` 重做，环境见运行环境文档的 IndexTTS 一节。
+
 - [在 5090 上复现混合版](issues/06-reproduce-hybrid.md)：复现成功，用户试听"基本等同"，整体 5090 版更好一些，问题句位置和 Mac 差不多但更明显；基线在 `books/wa2/baseline/*-混合版-5090.*`（小样过门槛 20/30、〈2002〉33/43，认人准确率略高于 Mac），用 `readbook.passage 小样|"2010-11-25 〈2002〉"` 重做；官方 PyTorch 版要对齐 mlx：非流式、子 talker 同温度、重复惩罚 1.5@64，并且**语音编码器必须用 fp32**（bf16 下雪菜一半候选跑偏）；参考码的微小差异会大幅改变复刻稳定性，方向因人而异（春希 bf16 编码更稳），可供 07/08 试；实测每字 0.49 秒，全书约 9.6 天，还没到一周。
 - [评测工具补强](issues/05-eval-tools.md)：`uv run python -m readbook.evaluate 小样|2002 <wav 目录或 MP3>` 一条命令出全部指标，Mac 混合版的基线在 `books/wa2/baseline/*-指标.md`（小样 29 句过门槛 21、〈2002〉44 句过 35，最弱是春希）；音色门槛取本人原声和原声中心相似度的 P5（春希 0.45、雪菜 0.40、依绪 0.59、武也 0.55）；CAM++、Whisper、emotion2vec+ 都在 readbook 环境里用 GPU 跑，不再依赖 IndexTTS2；pip-system-certs 和新版 huggingface_hub 冲突，readbook 改用 truststore；基线是从混好的 MP3 算的，06 要拿自己的 MP3 同样跑一遍再比。
 - [在 5090 上搭好可复现的基础环境](issues/01-windows-env.md)：Windows 上已经能读游戏剧本和原声，〈2002〉65 句对上了；torch 2.11 cu128、ffmpeg、Claude Code 都装好并验证过；本机路径放在 `config/windows.yaml`、`config/mac.yaml`，按平台自动选；Norton 会换证书，每个 Python 环境都要装 pip-system-certs；IndexTTS2 还没装。细节见 `docs/audiobook/小说转有声书运行环境.md`。
