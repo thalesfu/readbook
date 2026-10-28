@@ -5,13 +5,14 @@
     uv run python -m readbook.index_passage 2.5-plain 小样      # 对照：同样的句子不给情绪
     uv run python -m readbook.index_passage 2.5-ref 小样        # 本人有该情绪的定妆音就拿它当情感参考
     uv run python -m readbook.index_passage 2.5-原声平均锚点 小样  # 16 号票：用更像原声的那个锚点
+    uv run python -m readbook.index_passage 2.5-原声平均锚点全员 小样  # 16 号票：四人都用原声平均锚点
     uv run python -m readbook.index_passage stats 小样 2 2.5      # 候选级的"情绪 × 音色"表
     uv run python -m readbook.index_passage pair 小样 2.5 2.5-原声平均锚点   # 两版同一句同一种子的候选逐个配对
 
 - 音色：每个角色只用音色锚点（voices.yaml 的「平常」）。IndexTTS 只取参考的前 15 秒，超长的
   在 15 秒内最后一个停顿处截断（anchor_clip）。-原声平均锚点版只换这一项：rawanchor 用原声平均版重做的锚点
-  比旧定妆音更像原声的角色（这次只有春希）换成新锚点，情感参考、情感向量、质检目标都不变；挑选时"像锚点"
-  也改成和所用的锚点比；
+  比旧定妆音更像原声的角色（这次只有春希）换成新锚点，-原声平均锚点全员版四人都换；情感参考、情感向量、
+  质检目标都不变；挑选时"像锚点"也改成和所用的锚点比；
 - 情绪：EMOTION 表，2.0 和 2.5 共用。「平常」不给向量；讲述模式（叙述者的旁白和心里话、情绪平常）
   拿叙述者自己的讲述定妆音当情感参考，音色仍取锚点；
 - 每句按固定种子生成 TAKES 个候选，全部留着做统计；读入时切掉首尾静音（read_take）。挑选按混合版锚点版的做法顺序过一遍：
@@ -63,22 +64,24 @@ EMOTION = {
 EMOTION["激动"], EMOTION["低落"] = EMOTION["兴奋"], EMOTION["难过"]
 EMO_ALPHA = 1.0  # 全局强度旋钮；强弱已经写进向量
 RAWAVG = "原声平均锚点"  # 16 号票的版本后缀
+RAWAVG_ALL = "原声平均锚点全员"
 
 
 def speaker_anchors(variant: str, voices: dict) -> dict[str, Path]:
     """角色 → 整段音色锚点：默认是 voices.yaml 的「平常」；-原声平均锚点版里，rawanchor 重做的锚点
-    比旧定妆音更像原声的角色换成新的（rawanchor.adopted），其余不变。"""
+    比旧定妆音更像原声的角色换成新的（rawanchor.adopted），其余不变；-原声平均锚点全员版四人都换。"""
     old = {n: Path(v["平常"]["zh_audio"]) for n, v in voices.items()}
-    if variant == RAWAVG:
-        from .rawanchor import adopted
+    if variant in (RAWAVG, RAWAVG_ALL):
+        from .rawanchor import ANCHORS, adopted
 
-        return {**old, **{n: p for n, p in adopted().items() if n in old}}
+        new = {n: ANCHORS / f"{n}.wav" for n in old} if variant == RAWAVG_ALL else adopted()
+        return {**old, **{n: p for n, p in new.items() if n in old}}
     return old
 
 
 def clipped_anchors(variant: str, voices: dict) -> dict[str, Path]:
     """IndexTTS 实际用的说话人参考（前 15 秒）。"""
-    sub = f"anchors-{variant}" if variant == RAWAVG else "anchors"
+    sub = f"anchors-{variant}" if variant in (RAWAVG, RAWAVG_ALL) else "anchors"
     return {n: anchor_clip(p, WORK / sub / f"{n}.wav") for n, p in speaker_anchors(variant, voices).items()}
 
 
