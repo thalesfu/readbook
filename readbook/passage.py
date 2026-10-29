@@ -15,11 +15,13 @@ Mac 上用 mlx-audio 版，Windows 上用官方 PyTorch 版（见 bakeoff.TorchQ
 
     uv run python -m readbook.passage 小样 [--原声版|--原声向量版|--原声平均版]
     uv run python -m readbook.passage "2010-11-25 〈2002〉" "01 第二部-共通" 2010-11-25 2002
+    uv run python -m readbook.passage remix 小样 <wav 目录> <输出目录> [名字]   # 只重新混音
 """
 
 import json
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -27,7 +29,7 @@ import yaml
 
 from . import qc, wa2
 from .bakeoff import anchor_ref, load_qwen, mood_ref, sample_rows, synth_anchor, synth_qc
-from .scriptize import load_cast, scriptize
+from .scriptize import load_cast, pauses, scriptize, with_pauses
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT, read_jsonl, write_jsonl
 from .voices import SR
@@ -83,7 +85,8 @@ def load_rows(name: str, route: str | None, day: str | None, from_sid: str | Non
             d = {**l.__dict__, "idx": i, "voice_code": l.voice_code}
             raw.append(d)
         write_jsonl(OUT / "raw" / f"{name}.jsonl", raw)
-        write_jsonl(script, scriptize(raw, cast))
+        rows = scriptize(raw, cast)
+        write_jsonl(script, with_pauses(rows, pauses(rows, cast)))
         print("剧本化完成", len(raw), "句", flush=True)
     return read_jsonl(script)
 
@@ -144,7 +147,8 @@ def main(name: str, route: str | None = None, day: str | None = None, from_sid: 
     mix(label, rows, cast, wav, out)
 
 
-def mix(name, rows, cast, wav, out):
+def mix(name, rows, cast, wav, out) -> list[float]:
+    """返回每句的起始秒数（两版时间轴相同）。"""
     from .mix import assemble, to_mp3
 
     has_phone = any(r["effect"] == "电话" for r in rows)
@@ -158,22 +162,47 @@ def mix(name, rows, cast, wav, out):
         print(mp3, f"{len(audio) / SR / 60:.1f} 分钟", flush=True)
         if phone:
             write_table(name, rows, marks, out)
+            starts = marks
+    return starts
+
+
+def remix(name: str, wav: Path, out: Path, label: str, pause: dict[int, float] | None = None) -> list[float]:
+    """只重新混音：拿现成的逐句 wav 照剧本再混一遍，不合成。pause 给了就盖掉剧本里的 pause。"""
+    rows = load_rows(name, None, None, None)
+    if pause is not None:
+        rows = [{**r, "pause": pause.get(r["idx"], 0)} for r in rows]
+    out.mkdir(parents=True, exist_ok=True)
+    return mix(label, rows, load_cast(BOOK / "cast.yaml"), wav, out)
+
+
+def stamp(t: float) -> str:
+    """秒数 → m:ss.s。先取整到 0.1 秒再拆分钟，免得 299.97 写成 4:60.0。"""
+    m, d = divmod(round(t * 10), 600)
+    return f"{m}:{d // 10:02d}.{d % 10}"
 
 
 def write_table(name, rows, marks, out):
     head = [f"# {name} 对照剧本", "",
-            "时间戳按带电话效果的那版算，无电话效果版的时间轴相同。", "",
-            "| 时间 | # | 谁 | 类别 | 情绪 | 效果 | 台词 |", "|---|---|---|---|---|---|---|"]
+            "时间戳按带电话效果的那版算，无电话效果版的时间轴相同。", ""]
+    if any(r.get("pause") for r in rows):
+        head += ["【前停 N 秒】：这句前面隐去了别人的话，混音时在这句前面留出 N 秒空白（剧本的 pause）。", ""]
+    head += ["| 时间 | # | 谁 | 类别 | 情绪 | 效果 | 台词 |", "|---|---|---|---|---|---|---|"]
     body = []
     for r, t in zip(rows, marks):
         text = r["text"].replace("\n", " ").replace("|", "｜")
         if not qc.SPOKEN.search(text):
             text += "（静音）"
-        body.append(f"| {int(t // 60)}:{t % 60:04.1f} | {r['idx']} | {r['speaker']} | {TYPE[r['type']]} "
+        if r.get("pause"):
+            text = f"【前停 {r['pause']:g} 秒】{text}"
+        body.append(f"| {stamp(t)} | {r['idx']} | {r['speaker']} | {TYPE[r['type']]} "
                     f"| {r.get('mood', '')} | {r['effect']} | {text} |")
-    (out / f"{name} 对照剧本.md").write_text("\n".join(head + body) + "\n", encoding="utf-8")
+    (out / f"{name} 对照剧本.md").write_text("\n".join(head + body) + "\n", encoding="utf-8", newline="\n")
 
 
 if __name__ == "__main__":
-    args, variant = variant_arg(sys.argv[1:])
-    main(*args[:4], variant=variant)
+    if sys.argv[1] == "remix":
+        a = sys.argv[2:]
+        remix(a[0], Path(a[1]), Path(a[2]), a[3] if len(a) > 3 else a[0])
+    else:
+        args, variant = variant_arg(sys.argv[1:])
+        main(*args[:4], variant=variant)

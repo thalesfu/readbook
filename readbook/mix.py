@@ -83,10 +83,13 @@ def process(a: np.ndarray, row: dict, p: float, inner: bool) -> np.ndarray:
 
 
 def gap(prev: dict, row: dict) -> float:
-    """两句之间插多少秒静音。"""
+    """两句之间插多少秒静音。剧本给了 pause（这句前面隐去了别人的话，见 scriptize.pauses）就至少留这么久；
+    没有这一项的剧本照旧。"""
     if row["type"] != "台词" or prev["type"] != "台词":
-        return GAP["narration"]
-    return GAP["same"] if row["speaker"] == prev["speaker"] else GAP["change"]
+        g = GAP["narration"]
+    else:
+        g = GAP["same"] if row["speaker"] == prev["speaker"] else GAP["change"]
+    return max(g, row.get("pause", 0))
 
 
 def assemble(rows: list[dict], wav_dir: Path, cast: dict, inner: bool,
