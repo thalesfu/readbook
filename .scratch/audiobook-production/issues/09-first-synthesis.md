@@ -2,7 +2,7 @@
 
 Type: prototype（HITL）
 Status: open
-Blocked by: 01, 03, 05, 07, 08
+Blocked by: 01, 03, 05, 07, 08, 10
 
 ## Question
 

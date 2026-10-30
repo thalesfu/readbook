@@ -1,4 +1,4 @@
-"""按小样里试听认可的配置，做任意一段：取台词 → 剧本化 → 合成 → 混音 → MP3 和对照剧本。
+"""按小样里试听认可的配置，做任意一段：取台词 → 剧本化（含停顿、表演设置）→ 合成 → 混音 → MP3 和对照剧本。
 
 认可的配置（"混合版"），定妆音见 books/wa2/voices/voices.yaml：
 - 春希：分情绪版的定妆音，旁白和心里话用"讲述"；
@@ -27,7 +27,7 @@ import numpy as np
 import soundfile as sf
 import yaml
 
-from . import qc, wa2
+from . import perform, qc, wa2
 from .bakeoff import anchor_ref, load_qwen, mood_ref, sample_rows, synth_anchor, synth_qc
 from .scriptize import load_cast, pauses, scriptize, with_pauses
 from .synth import load_yaml, tts_text
@@ -73,6 +73,7 @@ def pick_ref(row, cast, voices):
 
 
 def load_rows(name: str, route: str | None, day: str | None, from_sid: str | None) -> list[dict]:
+    """剧本还没有就新建（合成规格第三节）：取台词 → 剧本化 → 停顿 → 表演设置 → 写剧本，每一遍只加自己的字段。"""
     if name == "小样":
         return sample_rows()
     cast = load_cast(BOOK / "cast.yaml")
@@ -86,7 +87,8 @@ def load_rows(name: str, route: str | None, day: str | None, from_sid: str | Non
             raw.append(d)
         write_jsonl(OUT / "raw" / f"{name}.jsonl", raw)
         rows = scriptize(raw, cast)
-        write_jsonl(script, with_pauses(rows, pauses(rows, cast)))
+        rows = with_pauses(rows, pauses(rows, cast))
+        write_jsonl(script, perform.with_perform(rows, perform.label(rows, cast), cast))
         print("剧本化完成", len(raw), "句", flush=True)
     return read_jsonl(script)
 

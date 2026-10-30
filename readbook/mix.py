@@ -2,7 +2,7 @@
 
 后期链（都在 48kHz 单声道上做，最后再摆到立体声里）：
 - 每句先削一点高频（HIGHS_DEFAULT，19 号票：压轻 IndexTTS-2.5 在耳机里的电子颤音），再把响度拉到同一水平；
-  剧本行带 gain（11 号票）的，整条后期链之后再加减音量；
+  剧本行有表演设置（perform，11 号票）的，整条后期链之后再按它的 gain 加减音量；
 - 心理活动（inner=True 时）：压低音量、去低频、轻微近讲提亮，再加短混响；
 - 电话：300–3400Hz 带通加轻度削波；
 - 回忆：去掉一点高频、压低音量，再加稍长一些的混响；
@@ -123,13 +123,13 @@ def gap(prev: dict, row: dict) -> float:
 def assemble(rows: list[dict], wav_dir: Path, cast: dict, inner: bool,
              marks: list[float] | None = None, highs: str | None = None) -> np.ndarray:
     """marks 不为 None 时，按顺序记下每句的起始秒数（给对照剧本用）。highs：HIGHS 里的一档，None 用默认。
-    行里有 gain（11 号票的逐句表演设置）就在后期链之后再加减这么多分贝。"""
+    行里有表演设置（perform）就在后期链之后按它的 gain 再加减这么多分贝，没有的不加减。"""
     chunks, prev, pos = [], None, 0
     for row in rows:
         a, sr = sf.read(wav_dir / f"{row['idx']:04d}.wav", dtype="float32")
         assert sr == SR
         p = cast["characters"].get(row["speaker"], {}).get("pan", 0.0)
-        st = db(process(a, row, p, inner, highs), row.get("gain", 0.0))
+        st = db(process(a, row, p, inner, highs), (row.get("perform") or {}).get("gain", 0.0))
         if prev is not None:
             n = int(gap(prev, row) * SR)
             chunks.append(np.zeros((n, 2), dtype=np.float32))

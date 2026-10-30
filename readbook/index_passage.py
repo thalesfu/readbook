@@ -22,7 +22,8 @@
   四人都换成 17 号票的规则重挑的锚点（rawanchor.ANCHORS17）；情感参考、情感向量、
   质检目标都不变。-表演A/B/C 版的锚点同 -原声平均锚点新规；
 - 情绪：EMOTION 表，2.0 和 2.5 共用。「平常」不给向量；讲述模式（叙述者的旁白和心里话、情绪平常）
-  拿叙述者自己的讲述定妆音当情感参考，音色仍取锚点；
+  拿叙述者自己的讲述定妆音当情感参考，音色仍取锚点。定版（-表演B混音）的剧本行有表演设置（perform）的，
+  情绪改用它的 vec，语速、音量用它的 tempo、gain（见 perform）；
 - 按轮生成和挑选（合成规格第五、六节，生产 01 号票）：每句第 k 个候选的种子是 idx × 100 + k。几段剧本放在一起，
   第 k 轮只给还没过关的句子生成第 k 个候选，一轮调一次 IndexTTS（每次加载模型 20–30 秒），最多 TAKES 轮。
   每个候选读入时切掉首尾静音（read_take），有表演设置的先按语速变速，再判两样：
@@ -145,11 +146,17 @@ def plan_row(row: dict, cast: dict, voices: dict, anchors: dict, mood_ref: bool 
 
 def plan(variant: str, name: str, cast: dict, voices: dict, anchors: dict, lex: dict) -> tuple[list[dict], dict]:
     """一段剧本：全部的行，以及要合成的句子 {idx: {row, text, chars, p, cands}}。p 是合成设置（plan_row，
-    有表演设置的再套上 perform.apply），cands 按顺序放每个候选的判定（judge）。
+    行里有表演设置 perform 的再套上 perform.apply），cands 按顺序放每个候选的判定（judge）。
+    表演设置：定版（2.5-表演B混音）用剧本行里的，没有的照旧；A/B/C 试做版换成 11 号票那一份；
+    其余版本去掉剧本里的，和以前的产物对得上。混音的音量也跟着行里的 perform 走。
     只有标点的、说话人没有音色的不合成，混音时插 0.8 秒静音。"""
     ver = perform.VERSIONS.get(variant)  # 11 号票：A/B/C，逐句表演设置
-    marks = perform.load(name) if ver else {}
     rows = load_rows(name, None, None, None)
+    if not ver:
+        rows = [{k: v for k, v in r.items() if k != "perform"} for r in rows]
+    elif variant not in perform.MIX:
+        marks = perform.load(name)
+        rows = [{**r, "perform": marks[r["idx"]]} for r in rows]
     todo = {}
     for r in rows:
         text = tts_text(r, lex)
@@ -160,8 +167,8 @@ def plan(variant: str, name: str, cast: dict, voices: dict, anchors: dict, lex: 
             if p["how"] == "平常":
                 continue
             p = {**p, "emo_vector": None, "emo_audio": None}
-        if ver:
-            p = perform.apply(p, marks[r["idx"]], ver, variant in perform.MIX)
+        if r.get("perform"):
+            p = perform.apply(p, r["perform"], ver, variant in perform.MIX)
         todo[r["idx"]] = {"row": r, "text": text, "chars": len(qc.SPOKEN.findall(text)), "p": p, "cands": []}
     return rows, todo
 
@@ -289,10 +296,9 @@ def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gate
     句子里通常就是最后那个过关的）；一个都没过的取像原声最高的。语速拉回目标，写 wav、qc.json、MP3、对照剧本、
     复核清单，返回挑选和混音各花了几秒。
     qc.json 的 take 是挑中第几个候选；sims 是每个候选的像原声（短句不查，记 null），voice、ok 是过没过音色门槛、
-    质检，gate 是本人的音色门槛，fallback 表示补完轮次还没过音色门槛。表演设置的版本另记 df、gain、target_rate。"""
-    variant = version.partition("-")[2]
-    ver = perform.VERSIONS.get(variant)
-    marks = perform.load(name) if ver else {}
+    质检，gate 是本人的音色门槛，fallback 表示补完轮次还没过音色门槛。有表演设置的句子另记 df、gain、target_rate。
+    rows 是 plan 给的，带着这一版用的表演设置。"""
+    ver = perform.VERSIONS.get(version.partition("-")[2])
     timing = {t["out"]: t for t in map(json.loads, (raw / "timing.jsonl").read_text(encoding="utf-8").splitlines())
               if "out" in t}
     emo_vecs = {}  # C 版的情感描述转成的向量：按轮生成的在 轮次/，以前的在 raw/
@@ -322,17 +328,17 @@ def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gate
                  gate=round(gates[r["speaker"]][1]["center_p5"], 3), fallback=fallback,
                  secs=round(sum(timing[str(take_path(raw, s, k))]["secs"] for k in range(len(cs))), 2),
                  dur=round(len(a) / SR, 2))
-        if ver:
-            notes[r["idx"]] = perform.note(marks[r["idx"]], p, ver, emo_vecs)
-            m.update(df=p["df"], gain=marks[r["idx"]]["gain"], target_rate=round(p["rate"], 2))
+        if r.get("perform"):
+            notes[r["idx"]] = perform.note(r["perform"], p, ver, emo_vecs)
+            m.update(df=p["df"], gain=r["perform"]["gain"], target_rate=round(p["rate"], 2))
         sf.write(f, a, SR)
         log[str(r["idx"])] = m
         print(r["idx"], m, flush=True)
     (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
     secs = {"pick": round(time.perf_counter() - t, 1)}
     t = time.perf_counter()
-    if ver:
-        rows = [{**r, "gain": marks[r["idx"]]["gain"], "perf_note": notes.get(r["idx"], "")} for r in rows]
+    if notes:
+        rows = [{**r, "perf_note": notes.get(r["idx"], "")} for r in rows]
     title = f"{name}-IndexTTS-{out.parent.name}"
     starts = mix(title, rows, cast, wav, out)
     write_review(title, rows, starts, log, out)
