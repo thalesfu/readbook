@@ -203,9 +203,10 @@ def real_pitch(cast: dict, names: list[str]) -> dict[str, np.ndarray]:
     return {n: np.array(have[n]) for n in names}
 
 
-def real_clips(vp: VoicePak, code: str):
-    """(语音文件, 音频)：按固定种子随机取的 REAL_N 句 1.5–15 秒原声，音色门槛和原声分布都用这一批。"""
-    files = sorted(f for f in vp.index if f.endswith(f"_{code}.OGG"))
+def real_clips(vp: VoicePak, code: str, files: list[str] | None = None):
+    """(语音文件, 音频)：按固定种子随机取的 REAL_N 句 1.5–15 秒原声，音色门槛和原声分布都用这一批。
+    files：只从这些语音文件里取（一个编号拆成几条声线时按声线取，见 voicelines）；默认取这个编号的全部。"""
+    files = sorted(files if files is not None else (f for f in vp.index if f.endswith(f"_{code}.OGG")))
     random.Random(REAL_SEED).shuffle(files)
     k = 0
     for f in files:
