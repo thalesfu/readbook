@@ -3,6 +3,7 @@
 Type: prototype（HITL）
 Status: open
 Blocked by: 09, 10
+搁置：2026-10-30 用户定的，跟着 09 号票一起搁置，不挡 15 号票。
 
 ## Question
 

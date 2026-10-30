@@ -2,7 +2,8 @@
 
 Type: grilling（HITL）
 Status: open
-Blocked by: 07, 08, 09, 10, 11, 12, 14, 16, 17, 18, 19
+Blocked by: 07, 10, 11, 14, 16, 17, 18, 19
+（2026-10-30：08 作废，09、12 搁置，从这里去掉。）
 
 ## Question
 

@@ -3,6 +3,7 @@
 Type: prototype（HITL）
 Status: open
 Blocked by: 03, 05, 06
+搁置：2026-10-30 用户定的，不挡 15 号票。IndexTTS-2.5 主线的音色已经过门槛、认人 100%，先不做 RVC。15 号票定完规格后，要是音色还不稳，或者想试 RVC 重新过一遍声码器能不能去掉 IndexTTS-2.5 的电子颤音，再拿出来。
 
 ## Question
 
