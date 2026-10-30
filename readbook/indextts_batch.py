@@ -8,7 +8,8 @@
   2.5 用 bf16，2.0 用 fp32。辅助模型（w2v-bert、BigVGAN、CAM++ 等）两版共用 checkpoints/hf_cache。
   11 号票多两项（只用于 2.5）：duration_factor 照传；emo_text 先交给自带的情感模型（QwenEmotion）转成向量，
   同一段文字只转一次（固定种子），再和 emo_vector 一样过 normalize_emo_vec，转出来的向量记在 emo_text.json。
-已存在的输出跳过。每条的耗时和时长追加到 jobs.json 旁的 timing.jsonl。
+已存在的输出跳过。加载模型的耗时追加到 jobs.json 旁的 timing.jsonl，每条的耗时和时长追加到这条输出旁的
+timing.jsonl：两者平常在同一个目录；index_passage 按轮生成时，一份 jobs 跨好几段剧本，各段的耗时仍记在各段的 raw/。
 """
 
 import json
@@ -71,33 +72,32 @@ def main(path: Path):
             print(f"emo_text {s} → {raw} → {emo[s]}", flush=True)
     if texts:
         emo_file.write_text(json.dumps(emo, ensure_ascii=False, indent=1), encoding="utf-8")
-    timing = path.with_name("timing.jsonl")
-    with timing.open("a", encoding="utf-8") as log:
+    with path.with_name("timing.jsonl").open("a", encoding="utf-8") as log:
         log.write(json.dumps({"load_secs": round(load_secs, 2), "version": version,
                               "emo_text_secs": round(time.perf_counter() - t, 2), "emo_texts": len(texts)}) + "\n")
-        for i, j in enumerate(todo):
-            kw = {"lang": "ZH"} if version == "2.5" else {}
-            if j.get("duration_factor"):
-                kw["duration_factor"] = j["duration_factor"]
-            if j.get("emo_text"):
-                kw["emo_vector"] = emo[j["emo_text"]]
-            elif j.get("emo_vector"):
-                kw["emo_vector"] = tts.normalize_emo_vec(j["emo_vector"], apply_bias=True)
-            elif j.get("emo_audio"):
-                kw["emo_audio_prompt"] = j["emo_audio"]
-            torch.manual_seed(j["seed"])
-            torch.cuda.synchronize()
-            t = time.perf_counter()
-            tts.infer(spk_audio_prompt=j["spk"], text=j["text"], output_path=j["out"], emo_alpha=j["emo_alpha"],
-                      use_random=False, verbose=False, max_mel_tokens=math.ceil(j["max_secs"] * TOKENS_PER_SEC[version]),
-                      **kw)
-            torch.cuda.synchronize()
-            secs = time.perf_counter() - t
-            dur = sf.info(j["out"]).duration
+    for i, j in enumerate(todo):
+        kw = {"lang": "ZH"} if version == "2.5" else {}
+        if j.get("duration_factor"):
+            kw["duration_factor"] = j["duration_factor"]
+        if j.get("emo_text"):
+            kw["emo_vector"] = emo[j["emo_text"]]
+        elif j.get("emo_vector"):
+            kw["emo_vector"] = tts.normalize_emo_vec(j["emo_vector"], apply_bias=True)
+        elif j.get("emo_audio"):
+            kw["emo_audio_prompt"] = j["emo_audio"]
+        torch.manual_seed(j["seed"])
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        tts.infer(spk_audio_prompt=j["spk"], text=j["text"], output_path=j["out"], emo_alpha=j["emo_alpha"],
+                  use_random=False, verbose=False, max_mel_tokens=math.ceil(j["max_secs"] * TOKENS_PER_SEC[version]),
+                  **kw)
+        torch.cuda.synchronize()
+        secs = time.perf_counter() - t
+        dur = sf.info(j["out"]).duration
+        with Path(j["out"]).with_name("timing.jsonl").open("a", encoding="utf-8") as log:
             log.write(json.dumps({"out": j["out"], "secs": round(secs, 3), "dur": round(dur, 3),
                                   "chars": j["chars"]}, ensure_ascii=False) + "\n")
-            log.flush()
-            print(f"index{version} {i + 1}/{len(todo)} {secs:.1f}s/{dur:.1f}s", flush=True)
+        print(f"index{version} {i + 1}/{len(todo)} {secs:.1f}s/{dur:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
