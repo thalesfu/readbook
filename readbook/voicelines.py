@@ -12,7 +12,8 @@
   中心更近（CAM++；自己那条的中心去掉这一句），任一边低于 MERGE_BELOW 就列出来，用户听过再定合不合并，
   定了的写进 MERGED；
 - 音色门槛：evaluate.real_clips 按这条声线的语音文件取原声，evaluate.voice_gate 的 center_p5；
-- 性别见 MALE。
+- 性别见 MALE；
+- 音色锚点（生产 05 号票）：rawanchor.make_lines 生成、登记进来的 ANCHOR_KEYS 几项，build 重跑时原样留着。
 
 声线.yaml 只记语音文件名和量出来的数，原声不进 git。
 
@@ -27,6 +28,7 @@ import random
 import sys
 from functools import cache
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -42,7 +44,9 @@ from daily import walk  # noqa: E402
 from lfpak import Pak  # noqa: E402
 
 TABLE = wa2.TOOLS.parent / "产出" / "语音对照.tsv"
-LINES_YAML = BOOK / "voices" / "声线.yaml"
+VOICES = BOOK / "voices"
+LINES_YAML = VOICES / "声线.yaml"
+ANCHOR_KEYS = ("锚点", "锚点文本", "锚点像原声", "目标音高", "目标语速")  # rawanchor.make_lines 登记的
 CACHE = OUT / "voicelines"
 SHARED = ("98", "99")   # 多个龙套共用的编号
 UNNAMED = ("", "？？？")  # 还没报出名字的本人
@@ -228,14 +232,14 @@ def build():
         by_code.setdefault(line["code"], []).append(line)
     vp = VoicePak()
     emb = Embeddings(vp)
+    old = load() if LINES_YAML.exists() else {}
     out = {}
     for line in lines:
         code, files = line["code"], line["files"]
         use = [f for f in files if usable(clips, f)]
         f0 = [clips[f]["f0"] for f in use]
-        # 编号只有一条声线时和 evaluate 一样取整个编号，现有四人的门槛不变
-        gate_files = None if len(by_code[code]) == 1 else files
-        E = np.array([emb(f, a) for f, a in real_clips(vp, code, files=gate_files)])
+        # 编号只有一条声线时和 evaluate 一样取整个编号，现有四人的门槛不变（同 gate_files）
+        E = np.array([emb(f, a) for f, a in real_clips(vp, code, files=None if len(by_code[code]) == 1 else files)])
         _, gate = voice_gate(E) if len(E) > 1 else (None, {"n": len(E), "center_p5": None})
         med = float(np.median(f0)) if f0 else None
         out[line_name(line)] = {
@@ -245,6 +249,7 @@ def build():
             "日语语速中位": round(float(np.median([clips[f]["rate"] for f in use])), 2) if use else None,
             "音色门槛": round(gate["center_p5"], 3) if gate["center_p5"] is not None else None,
             "门槛句数": gate["n"],
+            **{k: v for k, v in old.get(line_name(line), {}).items() if k in ANCHOR_KEYS},
         }
         print(line_name(line), out[line_name(line)]["原声句数"], out[line_name(line)]["音色门槛"], flush=True)
     by_actor = {}  # 同一个声优的声线两两互认：同编号的，加上一个人配两个编号的（20 和 36）
@@ -259,6 +264,11 @@ def build():
             out[line_name(b)].setdefault("互认", {})[line_name(a)] = round(hb, 3)
             print("互认", line_name(a), f"{ha:.3f}", line_name(b), f"{hb:.3f}", flush=True)
     emb.save()
+    save(out)
+
+
+def save(lines: dict):
+    """写 声线.yaml：文件头说明，加上写法和声线两块。"""
     aliases = {}
     for alt, main in ALIASES.items():
         aliases.setdefault(main, []).append(alt)
@@ -270,8 +280,11 @@ def build():
             "# - 原声句数：可用原声（1.5–12 秒、测得出音高和语速）；音高中位（Hz）、日语语速中位（字/秒）按它算；\n"
             "# - 性别：按声优，查不到的按角色，用声纹核对过（voicelines.MALE；音高分不开男女）；\n"
             "# - 音色门槛：evaluate.voice_gate 的 center_p5，原声按 evaluate.real_clips 取（1.5–15 秒，最多 300 句，种子 0）；\n"
-            f"# - 互认：和同一个声优的其他声线互相认人时，这条声线的原声认对的比例（最多 {RECOG_N} 句可用原声）。\n")
-    LINES_YAML.write_text(head + yaml.safe_dump({"写法": aliases, "声线": out}, allow_unicode=True,
+            f"# - 互认：和同一个声优的其他声线互相认人时，这条声线的原声认对的比例（最多 {RECOG_N} 句可用原声）；\n"
+            "# - 音色锚点（生产 05 号票，rawanchor.make_lines，规则见 readbook/rawanchor.py 和合成规格第四节）：\n"
+            "#   锚点＝锚点录音，路径相对 books/wa2/voices/；锚点文本＝它念的字；锚点像原声＝它和这条声线原声中心的\n"
+            "#   相似度（整段，CAM++）；目标音高（Hz）、目标语速（字/秒）是逐句质检的目标。挑选的明细在 锚点.yaml。\n")
+    LINES_YAML.write_text(head + yaml.safe_dump({"写法": aliases, "声线": lines}, allow_unicode=True,
                                                sort_keys=False, width=200), encoding="utf-8", newline="\n")
     print(LINES_YAML)
 
@@ -280,6 +293,20 @@ def build():
 
 def load() -> dict:
     return yaml.safe_load(LINES_YAML.read_text(encoding="utf-8"))["声线"]
+
+
+def gate_files(name: str, lines: dict | None = None) -> list[str] | None:
+    """音色门槛取原声的范围（evaluate.real_clips 的 files）：编号只有一条声线时取整个编号（None，和 evaluate
+    一样，现有四人的门槛不变），拆成几条的按这条声线的语音文件取。"""
+    lines = lines or load()
+    code = lines[name]["编号"]
+    return None if sum(v["编号"] == code for v in lines.values()) == 1 else files(name, lines)
+
+
+def anchor(name: str, lines: dict | None = None) -> Path:
+    """一条声线的音色锚点录音（整段；IndexTTS 只取前 15 秒，见 index_passage.anchor_clip）。"""
+    lines = lines or load()
+    return VOICES / lines[name]["锚点"]
 
 
 def line_of(code: str, speaker: str, lines: dict | None = None) -> str | None:

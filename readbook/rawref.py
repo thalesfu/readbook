@@ -21,21 +21,34 @@ books/wa2/voices/原声.yaml 只记语音文件名、日文逐字稿和目标，
 任何云服务）。合成时按文件名从语音包里现拼，缓存在 out/rawref/。参考的键名沿用 zh_audio、zh_text
 （bakeoff 里到处在用），原声版里装的是日语原声和日文逐字稿。
 
+生产 05 号票改成按声线取原声（line_ref），给全书每条声线做音色锚点（rawanchor.make_lines）：
+- 候选：这条声线的语音文件（voicelines.files）在三条路线里的；不到 MEAN_N 句的从全书所有路线取，还不够就
+  全部用上，平均向量少于 MEAN_N 句。原声.yaml 里的四人照旧，候选和以前一句不差；
+- 锚点文本：挑中片段的游戏中文译文（cn）；
+- 原声少的声线平稳句凑不满 10 秒，pick_anchor 依次放宽（RELAX）；
+- 目标语速的分母固定为 JP_MID。
+
     uv run python -m readbook.rawref    # 重建 原声.yaml；moods 型角色的情绪标签要调 claude -p，缓存在 out/rawref/
 """
 
 import json
 import re
+import sys
+from functools import cache
 
 import numpy as np
 import soundfile as sf
 import yaml
 
-from . import moods, qc
-from .bakeoff import ZH_RATE, sample_rows, voiced_lines
+from . import moods, qc, voicelines, wa2
+from .bakeoff import REF_ROUTES, ZH_RATE, sample_rows
 from .scriptize import load_cast
 from .trial import BOOK, OUT, read_jsonl
 from .voices import SR, VoicePak
+
+sys.path.insert(0, str(wa2.TOOLS))
+from daily import ROUTES, walk  # noqa: E402
+from lfpak import Pak  # noqa: E402
 
 VOICES = BOOK / "voices"
 RAW_YAML = VOICES / "原声.yaml"
@@ -44,6 +57,11 @@ CALM = re.compile(r"^[^！？!?…ー～〜♪―]+$")
 SOURCE = {"春希": "moods", "雪菜": "single", "依绪": "anchor", "武也": "anchor"}  # 和 passage.VOICE_SOURCE 一致
 TAIL = 0.5  # 参考末尾补的静音（秒）
 MEAN_N = 60  # 原声平均版每个参考取多少句原声算平均向量
+JP_MID = 5.13  # 春希、雪菜、依绪、武也四人日语语速的中位数（4.92、3.82、5.33、5.69），固定下来，不随加人变
+# 挑锚点片段：平稳句凑不满 10 秒（原声少的声线），就按顺序放宽，已挑的留着、接着往后凑（生产 05 号票）
+RELAX = (("平稳", lambda x: x["calm"] and 3.0 <= x["dur"] <= 8.0),
+         ("不要求平稳", lambda x: 3.0 <= x["dur"] <= 8.0),
+         ("全部候选", lambda x: True))
 
 
 def held_out() -> set[str]:
@@ -52,11 +70,26 @@ def held_out() -> set[str]:
     return {r["voice"] for r in rows if r.get("voice")}
 
 
-def pool(vp: VoicePak, code: str, skip: set[str]) -> list[dict]:
-    """这个角色的候选原声：1.5–12 秒、测得出音高和语速的句子。"""
+@cache
+def voiced() -> list[tuple[str, str, str, str]]:
+    """全书的有声台词 (路线, 语音文件, 日文, 中文)，按 daily.ROUTES 的顺序；中日两份字节码按顺序对齐，
+    和 bakeoff.voiced_lines 一样（全书逐句核对过语音文件，一句不差）。"""
+    jp, cn = Pak(wa2.GAME / "script.pak"), Pak(wa2.GAME / "ck-gal.pak")
+    out = []
+    for folder, _, chain in ROUTES:
+        for sid in chain:
+            a = [e for e in walk(jp, sid, "cp932") if e[0] == "line"]
+            b = [e for e in walk(cn, sid, "cn") if e[0] == "line"]
+            out += [(folder, x[3], wa2.strip_quotes(wa2.clean(x[2]).replace("\n", "")),
+                     wa2.strip_quotes(wa2.clean(y[2]).replace("\n", ""))) for x, y in zip(a, b) if x[3]]
+    return out
+
+
+def pool(vp: VoicePak, files: set[str], skip: set[str], routes=REF_ROUTES) -> list[dict]:
+    """候选原声：这些语音文件里落在 routes（None 是全书）的、1.5–12 秒、测得出音高和语速的句子。"""
     items, seen = [], set()
-    for name, jp, cn in voiced_lines(code):
-        if name in seen or name in skip:
+    for route, name, jp, cn in voiced():
+        if (routes and route not in routes) or name not in files or name in seen or name in skip:
             continue
         seen.add(name)
         a = vp.audio(name)
@@ -67,19 +100,29 @@ def pool(vp: VoicePak, code: str, skip: set[str]) -> list[dict]:
     return items
 
 
+def line_pool(vp: VoicePak, name: str, skip: set[str]) -> tuple[list[dict], str]:
+    """一条声线的候选：三条路线里不到 MEAN_N 句，就从全书所有路线取，还不够就全部用上。返回 (候选, 取自哪里)。"""
+    files = set(voicelines.files(name))
+    items = pool(vp, files, skip)
+    return (items, "三条路线") if len(items) >= MEAN_N else (pool(vp, files, skip, None), "全书")
+
+
 def pick_anchor(items: list[dict], span=(10.0, 18.0)) -> list[dict]:
+    """3–8 秒的平稳句，按音高、语速离中位数的远近排序，音高权重 2，凑够 span[0] 秒、不超过 span[1] 秒。
+    凑不够就按 RELAX 放宽；每句记下自己是按哪一档挑进来的（relax）。"""
     mf = float(np.median([x["f0"] for x in items]))
     mr = float(np.median([x["rate"] for x in items]))
-    calm = [x for x in items if x["calm"] and 3.0 <= x["dur"] <= 8.0]
-    calm.sort(key=lambda x: 2 * abs(np.log(x["f0"] / mf)) + abs(np.log(x["rate"] / mr)))
     out, total = [], 0.0
-    for x in calm:
-        if total + x["dur"] > span[1]:
-            continue
-        out.append(x)
-        total += x["dur"] + 0.35
-        if total >= span[0]:
-            break
+    for how, keep in RELAX:
+        cands = [x for x in items if keep(x) and x["file"] not in {y["file"] for y in out}]
+        cands.sort(key=lambda x: 2 * abs(np.log(x["f0"] / mf)) + abs(np.log(x["rate"] / mr)))
+        for x in cands:
+            if total + x["dur"] > span[1]:
+                continue
+            out.append({**x, "relax": how})
+            total += x["dur"] + 0.35
+            if total >= span[0]:
+                return out
     return out
 
 
@@ -107,12 +150,28 @@ def entry(clips: list[dict], rate: float, group: list[dict]) -> dict:
             "平均向量": sorted(x["file"] for x in random.Random(0).sample(group, min(MEAN_N, len(group))))}
 
 
+def line_ref(vp: VoicePak, name: str, skip: set[str]) -> dict:
+    """一条声线的锚点参考（生产 05 号票）：挑中的片段（text 日文、cn 中文）、目标音高和语速、平均向量的原声。
+    放宽：挑片段用到了 RELAX 的哪一档（只记放宽了的）。"""
+    items, src = line_pool(vp, name, skip)
+    clips = pick_anchor(items)
+    jp_rate = float(np.median([x["rate"] for x in items]))
+    ref = {"候选": src, "候选句数": len(items), "日语语速中位": round(jp_rate, 2),
+           **entry(clips, ZH_RATE * jp_rate / JP_MID, items),
+           "cn": moods.join_text([x["cn"] for x in clips]), "片段秒数": round(sum(x["dur"] for x in clips), 2)}
+    if clips[-1]["relax"] != RELAX[0][0]:
+        ref["放宽"] = clips[-1]["relax"]
+    return ref
+
+
 def build():
     cast = load_cast(BOOK / "cast.yaml")
     mixed = yaml.safe_load((VOICES / "voices.yaml").read_text(encoding="utf-8"))
     vp = VoicePak()
     skip = held_out()
-    pools = {n: pool(vp, cast["characters"][n]["code"], skip) for n in SOURCE}
+    lines = voicelines.load()
+    pools = {n: pool(vp, set(voicelines.files(voicelines.line_of(cast["characters"][n]["code"], n, lines), lines)),
+                     skip) for n in SOURCE}
     jp_rate = {n: float(np.median([x["rate"] for x in p])) for n, p in pools.items()}
     jp_mid = float(np.median(list(jp_rate.values())))
     out = {}
