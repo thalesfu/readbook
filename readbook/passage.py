@@ -147,15 +147,15 @@ def main(name: str, route: str | None = None, day: str | None = None, from_sid: 
     mix(label, rows, cast, wav, out)
 
 
-def mix(name, rows, cast, wav, out) -> list[float]:
-    """返回每句的起始秒数（两版时间轴相同）。"""
+def mix(name, rows, cast, wav, out, highs: str | None = None) -> list[float]:
+    """返回每句的起始秒数（两版时间轴相同）。highs：mix.HIGHS 里的一档，None 用默认。"""
     from .mix import assemble, to_mp3
 
     has_phone = any(r["effect"] == "电话" for r in rows)
     for label, phone in (("", True), ("（无电话效果）", False))[: 2 if has_phone else 1]:
         rs = rows if phone else [{**r, "effect": "无" if r["effect"] == "电话" else r["effect"]} for r in rows]
         marks = []
-        audio = assemble(rs, wav, cast, inner=True, marks=marks)
+        audio = assemble(rs, wav, cast, inner=True, marks=marks, highs=highs)
         mp3 = out / f"{name}{label}.mp3"
         to_mp3(audio, mp3, {"album": "白色相簿2 剧本全集（试做）", "title": f"{name}{label}",
                             "artist": "AI 有声书试做"})
@@ -166,13 +166,14 @@ def mix(name, rows, cast, wav, out) -> list[float]:
     return starts
 
 
-def remix(name: str, wav: Path, out: Path, label: str, pause: dict[int, float] | None = None) -> list[float]:
+def remix(name: str, wav: Path, out: Path, label: str, pause: dict[int, float] | None = None,
+          highs: str | None = None) -> list[float]:
     """只重新混音：拿现成的逐句 wav 照剧本再混一遍，不合成。pause 给了就盖掉剧本里的 pause。"""
     rows = load_rows(name, None, None, None)
     if pause is not None:
         rows = [{**r, "pause": pause.get(r["idx"], 0)} for r in rows]
     out.mkdir(parents=True, exist_ok=True)
-    return mix(label, rows, load_cast(BOOK / "cast.yaml"), wav, out)
+    return mix(label, rows, load_cast(BOOK / "cast.yaml"), wav, out, highs)
 
 
 def stamp(t: float) -> str:

@@ -34,7 +34,7 @@ from .config import INDEX_DIR, hf_model
 from .scriptize import load_cast
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT, read_jsonl
-from .voices import SR, VoicePak
+from .voices import SR, VoicePak, to48k
 
 sys.path.insert(0, str(wa2.TOOLS))
 from daily import ROUTES, walk  # noqa: E402
@@ -524,19 +524,20 @@ def qwen_takes(model, text: str, ref: dict, tries: int, temperature: float | Non
 
 
 def finish(cands: list[np.ndarray], text: str, ref: dict) -> tuple[np.ndarray, dict]:
-    """从候选里挑偏差最小的，再把语速拉回目标的 0.85–1.2 倍。"""
+    """从候选里挑偏差最小的，再把语速拉回目标的 0.85–1.2 倍。明细里的 pick 是挑中的是 cands 里第几个。"""
     def penalized(a):
         score, m = qc.judge(a, text, ref["f0"], ref["rate"])
         jump = qc.max_jump(a, ref["f0"])
         return score + max(0.0, jump - 1.3) * 3, {**m, "jump": round(jump, 2)}
 
-    scored = [(penalized(a), a) for a in cands]
-    (score, m), a = min(scored, key=lambda x: x[0][0])
+    scored = [penalized(a) for a in cands]
+    i = min(range(len(cands)), key=lambda i: scored[i][0])
+    (score, m), a = scored[i], cands[i]
     if m["rate"]:
         lo, hi = ref["rate"] * 0.85, ref["rate"] * 1.2
         want = min(max(m["rate"], lo), hi)
         a = qc.stretch(a, want / m["rate"])
-    return a, {"score": round(score, 3), **m, "tries": len(cands)}
+    return a, {"score": round(score, 3), **m, "tries": len(cands), "pick": i}
 
 
 def ok(a: np.ndarray, text: str, ref: dict, jump: float | None = None) -> bool:
@@ -600,13 +601,6 @@ def cmd_synth(methods: list[str]):
         (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def to48k(a: np.ndarray, sr: int) -> np.ndarray:
-    if sr == SR:
-        return a
-    n = int(round(len(a) * SR / sr))
-    return np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32)
-
-
 def cmd_index():
     """把任务写成 JSON，交给 IndexTTS2 环境里的批处理脚本；回来后同样质检、挑选、变速。"""
     refs = yaml.safe_load((WORK / "refs.yaml").read_text(encoding="utf-8"))
@@ -636,10 +630,7 @@ def cmd_index():
         cands = []
         for k in range(2):
             a, sr = sf.read(raw / f"{r['idx']:04d}-{k}.wav", dtype="float32")
-            if a.ndim > 1:
-                a = a.mean(axis=1)
-            n = int(round(len(a) * SR / sr))
-            cands.append(np.interp(np.linspace(0, len(a), n, endpoint=False), np.arange(len(a)), a).astype(np.float32))
+            cands.append(to48k(a.mean(axis=1) if a.ndim > 1 else a, sr))
         a, m = finish(cands, text, refs[r["speaker"]])
         sf.write(out / f"{r['idx']:04d}.wav", a, SR)
         log[r["idx"]] = m

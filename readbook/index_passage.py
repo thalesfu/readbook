@@ -9,6 +9,7 @@
     uv run python -m readbook.index_passage 2.5-原声平均锚点新规 小样  # 17 号票：锚点按补全的挑选规则重挑
     uv run python -m readbook.index_passage stats 小样 2 2.5      # 候选级的"情绪 × 音色"表
     uv run python -m readbook.index_passage pair 小样 2.5 2.5-原声平均锚点   # 两版同一句同一种子的候选逐个配对
+    uv run python -m readbook.index_passage repick 2.5-原声平均锚点新规 小样   # 19 号票：现成候选重新挑选、混音
 
 - 音色：每个角色只用音色锚点（voices.yaml 的「平常」）。IndexTTS 只取参考的前 15 秒，超长的
   在 15 秒内最后一个停顿处截断（anchor_clip）。-原声平均锚点版只换这一项：rawanchor 用原声平均版重做的锚点
@@ -34,14 +35,14 @@ import numpy as np
 import soundfile as sf
 
 from . import qc
-from .bakeoff import SIM_LINE, finish, ok, to48k
+from .bakeoff import SIM_LINE, finish, ok
 from .config import INDEX_DIR
 from .moods import NARRATION
 from .passage import load_rows, load_voices, mix
 from .scriptize import load_cast
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT
-from .voices import SR
+from .voices import SR, to48k
 
 WORK = OUT / "index"
 TAKES = 4
@@ -165,13 +166,24 @@ def build(version: str, name: str):
     pick(version, name, rows, cast, voices, anchors, lex, mood_ref, speaker_anchors(variant, voices))
 
 
-def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=None):
-    """full：挑选时"像锚点"和谁比（整段锚点），默认是 voices.yaml 的「平常」。"""
+def repick(version: str, name: str):
+    """19 号票：不重新合成，拿这一版 raw/ 里现成的候选重新挑选、混音（转 48 kHz 改用 soxr 以后），
+    产物写到 <版本>-重采样/<名字>/。"""
+    variant = version.partition("-")[2]
+    voices = load_voices()
+    pick(version, name, load_rows(name, None, None, None), load_cast(BOOK / "cast.yaml"), voices,
+         clipped_anchors(variant, voices), load_yaml(BOOK / "lexicon.yaml"), variant == "ref",
+         speaker_anchors(variant, voices), out=WORK / f"{version}-重采样" / name)
+
+
+def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=None, out=None):
+    """full：挑选时"像锚点"和谁比（整段锚点），默认是 voices.yaml 的「平常」。
+    out：成品写到哪（默认和候选同一个目录），候选总是读这一版的 raw/。qc.json 的 take 是挑中的第几个候选。"""
     from .speaker import SpeakerSim
 
     full = full or speaker_anchors("", voices)
-    out = WORK / version / name
-    raw, wav = out / "raw", out / "wav"
+    out = out or WORK / version / name
+    raw, wav = WORK / version / name / "raw", out / "wav"
     wav.mkdir(parents=True, exist_ok=True)
     timing = {Path(t["out"]).name: t for t in map(json.loads, (raw / "timing.jsonl").read_text(encoding="utf-8")
                                                   .splitlines()) if "out" in t}
@@ -194,17 +206,18 @@ def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=N
             used.append((s, a))
             if s >= SIM_LINE and ok(a, text, p, 1.45):
                 break
-        passed = [a for s, a in used if s >= SIM_LINE]
-        a, m = finish(passed or [max(used, key=lambda x: x[0])[1]], text, p)
+        passed = [k for k, (s, _) in enumerate(used) if s >= SIM_LINE] or [max(range(len(used)),
+                                                                                key=lambda k: used[k][0])]
+        a, m = finish([used[k][1] for k in passed], text, p)
         m = {k: (float(v) if isinstance(v, (np.floating, float)) else v) for k, v in m.items()}
-        m.update(how=p["how"], tries=len(used), sims=[round(s, 3) for s, _ in cands],
+        m.update(take=passed[m.pop("pick")], how=p["how"], tries=len(used), sims=[round(s, 3) for s, _ in cands],
                  secs=round(sum(timing[f"{r['idx']:04d}-{k}.wav"]["secs"] for k in range(len(used))), 2),
                  dur=round(len(a) / SR, 2))
         sf.write(f, a, SR)
         log[str(r["idx"])] = m
         print(r["idx"], m, flush=True)
     (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
-    mix(f"{name}-IndexTTS-{version}", rows, cast, wav, out)
+    mix(f"{name}-IndexTTS-{out.parent.name}", rows, cast, wav, out)
 
 
 def read_take(path: Path) -> np.ndarray:
@@ -408,5 +421,7 @@ if __name__ == "__main__":
         stats(sys.argv[2], sys.argv[3:])
     elif sys.argv[1] == "pair":
         pair(*sys.argv[2:5])
+    elif sys.argv[1] == "repick":
+        repick(*sys.argv[2:4])
     else:
         build(sys.argv[1], sys.argv[2])

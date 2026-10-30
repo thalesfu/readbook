@@ -10,6 +10,8 @@ dependencies = [
     "pyyaml>=6.0.3",
     "scipy>=1.18.1",
     "soundfile>=0.14.0",
+    # 转 48 kHz 用（voices.to48k），19 号票之前是线性插值、带镜像
+    "soxr>=1.1.0",
     # Windows 5090（Blackwell）：cu128 这条线最新到 2.11.0
     "torch==2.11.0; sys_platform == 'win32'",
     "torchaudio==2.11.0; sys_platform == 'win32'",

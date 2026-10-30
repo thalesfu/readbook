@@ -1,7 +1,7 @@
 """混音：逐句后期 → 立体声定位 → 拼接 → MP3。
 
 后期链（都在 48kHz 单声道上做，最后再摆到立体声里）：
-- 每句先把响度拉到同一水平；
+- 每句先削一点高频（HIGHS_DEFAULT，19 号票：压轻 IndexTTS-2.5 在耳机里的电子颤音），再把响度拉到同一水平；
 - 心理活动（inner=True 时）：压低音量、去低频、轻微近讲提亮，再加短混响；
 - 电话：300–3400Hz 带通加轻度削波；
 - 回忆：去掉一点高频、压低音量，再加稍长一些的混响；
@@ -21,6 +21,16 @@ from scipy.signal import butter, fftconvolve, sosfilt
 SR = 48000
 TARGET_RMS = 10 ** (-20 / 20)
 GAP = {"same": 0.25, "change": 0.4, "narration": 0.5}
+# 高频处理（19 号票）：IndexTTS-2.5 的输出戴耳机听有电子颤音，削一点高频能轻一些，代价是发闷。
+# 名字 → ("shelf", 转折频率 Hz, 增益 dB) 高架，或 ("lp1", 转折频率 Hz) 一阶低通（往上每倍频程 −6 dB）。
+HIGHS = {
+    "不处理": None,
+    "压8k": ("shelf", 8000, -12),
+    "缓4k": ("lp1", 4000),
+    "缓2.5k": ("lp1", 2500),
+    "缓1.5k": ("lp1", 1500),
+}
+HIGHS_DEFAULT = "缓4k"  # 用户戴 AirPods 试听 A/B 挑的：颤音轻一些、不闷，指标和不处理持平；旁白和台词一样
 
 
 def norm(a: np.ndarray) -> np.ndarray:
@@ -34,6 +44,23 @@ def db(a: np.ndarray, gain: float) -> np.ndarray:
 
 def filt(a: np.ndarray, kind: str, freq) -> np.ndarray:
     return sosfilt(butter(4, freq, kind, fs=SR, output="sos"), a)
+
+
+def tame(a: np.ndarray, highs: str | None = None) -> np.ndarray:
+    """按 HIGHS 里的一档削高频；None 用 HIGHS_DEFAULT。"""
+    spec = HIGHS[highs or HIGHS_DEFAULT]
+    if spec is None:
+        return a
+    if spec[0] == "lp1":
+        return sosfilt(butter(1, spec[1], "lowpass", fs=SR, output="sos"), a)
+    # RBJ 高架滤波器，坡度 S=1：转折频率处是一半增益，往上一个倍频程左右到满
+    _, f0, gain = spec
+    A, w = 10 ** (gain / 40), 2 * np.pi * f0 / SR
+    alpha = np.sin(w) / 2 * np.sqrt(2)
+    c, k = np.cos(w), 2 * np.sqrt(A) * alpha
+    b = [A * ((A + 1) + (A - 1) * c + k), -2 * A * ((A - 1) + (A + 1) * c), A * ((A + 1) + (A - 1) * c - k)]
+    d = [(A + 1) - (A - 1) * c + k, 2 * ((A - 1) - (A + 1) * c), (A + 1) - (A - 1) * c - k]
+    return sosfilt(np.array([[*b, *d]]) / d[0], a)
 
 
 def reverb_ir(seconds: float, seed: int) -> np.ndarray:
@@ -60,8 +87,8 @@ def pan(a: np.ndarray, p: float) -> np.ndarray:
     return np.stack([a * np.cos(theta), a * np.sin(theta)], axis=1) * np.sqrt(2)
 
 
-def process(a: np.ndarray, row: dict, p: float, inner: bool) -> np.ndarray:
-    a = norm(a)
+def process(a: np.ndarray, row: dict, p: float, inner: bool, highs: str | None = None) -> np.ndarray:
+    a = norm(tame(a, highs))  # 先削高频再拉响度，几档之间响度一样
     effect = row["effect"]
     if row["type"] == "心理活动" and inner:
         a = db(filt(a, "highpass", 120), -4)
@@ -93,14 +120,14 @@ def gap(prev: dict, row: dict) -> float:
 
 
 def assemble(rows: list[dict], wav_dir: Path, cast: dict, inner: bool,
-             marks: list[float] | None = None) -> np.ndarray:
-    """marks 不为 None 时，按顺序记下每句的起始秒数（给对照剧本用）。"""
+             marks: list[float] | None = None, highs: str | None = None) -> np.ndarray:
+    """marks 不为 None 时，按顺序记下每句的起始秒数（给对照剧本用）。highs：HIGHS 里的一档，None 用默认。"""
     chunks, prev, pos = [], None, 0
     for row in rows:
         a, sr = sf.read(wav_dir / f"{row['idx']:04d}.wav", dtype="float32")
         assert sr == SR
         p = cast["characters"].get(row["speaker"], {}).get("pan", 0.0)
-        st = process(a, row, p, inner)
+        st = process(a, row, p, inner, highs)
         if prev is not None:
             n = int(gap(prev, row) * SR)
             chunks.append(np.zeros((n, 2), dtype=np.float32))

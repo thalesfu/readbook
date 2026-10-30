@@ -13,6 +13,7 @@ import sys
 
 import numpy as np
 import soundfile as sf
+import soxr
 
 from . import wa2
 from .wa2 import GAME
@@ -38,11 +39,15 @@ class VoicePak:
         """读出一条语音，转成 48kHz 单声道 float32。"""
         p, e = self.index[name]
         data, sr = sf.read(io.BytesIO(p.read(e)), dtype="float32", always_2d=True)
-        mono = data.mean(axis=1)
-        if sr != SR:
-            n = int(round(len(mono) * SR / sr))
-            mono = np.interp(np.linspace(0, len(mono), n, endpoint=False), np.arange(len(mono)), mono)
-        return mono.astype(np.float32)
+        return to48k(data.mean(axis=1), sr)
+
+
+def to48k(a: np.ndarray, sr: int) -> np.ndarray:
+    """转成 48kHz（soxr，带抗镜像滤波）。19 号票之前用线性插值，把 22.05/24 kHz 的输出转上来时
+    原 Nyquist 以上会翻折出一层镜像（耳机里听着像电子颤音），通带里的高频也被压暗。"""
+    if sr == SR:
+        return a.astype(np.float32)
+    return soxr.resample(a.astype(np.float32), sr, SR, quality="HQ")
 
 
 def candidates(code: str, routes=("01 第二部-共通", "02 第二部-雪菜线", "07 第三部-共通前半")):
