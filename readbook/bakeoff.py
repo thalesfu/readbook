@@ -540,8 +540,9 @@ def finish(cands: list[np.ndarray], text: str, ref: dict) -> tuple[np.ndarray, d
     return a, {"score": round(score, 3), **m, "tries": len(cands), "pick": i}
 
 
-def ok(a: np.ndarray, text: str, ref: dict, jump: float | None = None) -> bool:
-    if len(a) / SR > 2.5 + 0.5 * len(qc.SPOKEN.findall(text)):
+def ok(a: np.ndarray, text: str, ref: dict, jump: float | None = None, slow: float = 1.0) -> bool:
+    """slow：这句有意放慢的倍数（11 号票的 duration_factor），时长上限跟着放宽。"""
+    if len(a) / SR > (2.5 + 0.5 * len(qc.SPOKEN.findall(text))) * slow:
         return False
     if jump and qc.max_jump(a, ref["f0"]) > jump:
         return False

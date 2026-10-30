@@ -10,12 +10,13 @@
     uv run python -m readbook.index_passage stats 小样 2 2.5      # 候选级的"情绪 × 音色"表
     uv run python -m readbook.index_passage pair 小样 2.5 2.5-原声平均锚点   # 两版同一句同一种子的候选逐个配对
     uv run python -m readbook.index_passage repick 2.5-原声平均锚点新规 小样   # 19 号票：现成候选重新挑选、混音
+    uv run python -m readbook.index_passage 2.5-表演A 小样   # 11 号票：逐句表演设置（A/B/C 三种做法，见 perform）
 
 - 音色：每个角色只用音色锚点（voices.yaml 的「平常」）。IndexTTS 只取参考的前 15 秒，超长的
   在 15 秒内最后一个停顿处截断（anchor_clip）。-原声平均锚点版只换这一项：rawanchor 用原声平均版重做的锚点
   比旧定妆音更像原声的角色（这次只有春希）换成新锚点，-原声平均锚点全员版四人都换，-原声平均锚点新规版
   四人都换成 17 号票的规则重挑的锚点（rawanchor.ANCHORS17）；情感参考、情感向量、
-  质检目标都不变；挑选时"像锚点"也改成和所用的锚点比；
+  质检目标都不变；挑选时"像锚点"也改成和所用的锚点比。-表演A/B/C 版的锚点同 -原声平均锚点新规；
 - 情绪：EMOTION 表，2.0 和 2.5 共用。「平常」不给向量；讲述模式（叙述者的旁白和心里话、情绪平常）
   拿叙述者自己的讲述定妆音当情感参考，音色仍取锚点；
 - 每句按固定种子生成 TAKES 个候选，全部留着做统计；读入时切掉首尾静音（read_take）。挑选按混合版锚点版的做法顺序过一遍：
@@ -34,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from . import qc
+from . import perform, qc
 from .bakeoff import SIM_LINE, finish, ok
 from .config import INDEX_DIR
 from .moods import NARRATION
@@ -74,7 +75,8 @@ RAWAVG_RULE = "原声平均锚点新规"  # 17 号票
 def speaker_anchors(variant: str, voices: dict) -> dict[str, Path]:
     """角色 → 整段音色锚点：默认是 voices.yaml 的「平常」；-原声平均锚点版里，rawanchor 重做的锚点
     比旧定妆音更像原声的角色换成新的（rawanchor.adopted），其余不变；-原声平均锚点全员版四人都换；
-    -原声平均锚点新规版四人都换成 17 号票重挑的。"""
+    -原声平均锚点新规版四人都换成 17 号票重挑的；-表演A/B/C 版同新规。"""
+    variant = RAWAVG_RULE if variant in perform.VERSIONS else variant
     old = {n: Path(v["平常"]["zh_audio"]) for n, v in voices.items()}
     if variant in (RAWAVG, RAWAVG_ALL, RAWAVG_RULE):
         from .rawanchor import ANCHORS, ANCHORS17, adopted
@@ -87,6 +89,7 @@ def speaker_anchors(variant: str, voices: dict) -> dict[str, Path]:
 
 def clipped_anchors(variant: str, voices: dict) -> dict[str, Path]:
     """IndexTTS 实际用的说话人参考（前 15 秒）。"""
+    variant = RAWAVG_RULE if variant in perform.VERSIONS else variant
     sub = f"anchors-{variant}" if variant in (RAWAVG, RAWAVG_ALL, RAWAVG_RULE) else "anchors"
     return {n: anchor_clip(p, WORK / sub / f"{n}.wav") for n, p in speaker_anchors(variant, voices).items()}
 
@@ -130,7 +133,9 @@ def plan_row(row: dict, cast: dict, voices: dict, anchors: dict, mood_ref: bool 
 def build(version: str, name: str):
     model, _, variant = version.partition("-")
     plain, mood_ref = variant == "plain", variant == "ref"
+    ver = perform.VERSIONS.get(variant)  # 11 号票：A/B/C，逐句表演设置
     rows = load_rows(name, None, None, None)
+    marks = perform.load(name) if ver else None
     cast = load_cast(BOOK / "cast.yaml")
     voices = load_voices()
     lex = load_yaml(BOOK / "lexicon.yaml")
@@ -148,22 +153,32 @@ def build(version: str, name: str):
             if p["how"] == "平常":
                 continue
             p = {**p, "emo_vector": None, "emo_audio": None}
+        if ver:
+            p = perform.apply(p, marks[r["idx"]], ver, variant in perform.MIX)
         chars = len(qc.SPOKEN.findall(text))
         for k in range(TAKES):
-            jobs.append({"out": str((raw / f"{r['idx']:04d}-{k}.wav").resolve()), "text": text,
-                         "spk": p["spk"], "emo_vector": p.get("emo_vector"), "emo_audio": p.get("emo_audio"),
-                         "emo_alpha": EMO_ALPHA, "seed": r["idx"] * 100 + k, "chars": chars,
-                         "max_secs": 3.5 + 0.5 * chars})
+            j = {"out": str((raw / f"{r['idx']:04d}-{k}.wav").resolve()), "text": text,
+                 "spk": p["spk"], "emo_vector": p.get("emo_vector"), "emo_audio": p.get("emo_audio"),
+                 "emo_alpha": p.get("alpha", EMO_ALPHA), "seed": r["idx"] * 100 + k, "chars": chars,
+                 "max_secs": 3.5 + 0.5 * chars}  # 生成上限管的是语义 token，duration_factor 不影响
+            if p.get("emo_text"):
+                j["emo_text"] = p["emo_text"]
+            if p.get("df", 1.0) != 1.0:
+                j["duration_factor"] = p["df"]
+            jobs.append(j)
     # 按参考排好：IndexTTS 只缓存一个说话人和一个情感参考，换参考要重新提特征
     jobs.sort(key=lambda j: (j["spk"], j["emo_audio"] or "", j["out"]))
     (raw / "jobs.json").write_text(json.dumps({"version": model, "jobs": jobs}, ensure_ascii=False, indent=0),
                                    encoding="utf-8")
+    if ver:  # 和基线（或别的版本）一模一样的任务不重新合成
+        for src in perform.sources(variant, name):
+            perform.reuse(jobs, WORK / src / name / "raw", raw)
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "HF_HUB_OFFLINE": "1"}
     subprocess.run(["uv", "run", "--project", str(INDEX_DIR), "python", str(BATCH), str(raw / "jobs.json")],
                    cwd=INDEX_DIR, env=env, check=True)
     if plain:
         return
-    pick(version, name, rows, cast, voices, anchors, lex, mood_ref, speaker_anchors(variant, voices))
+    pick(version, name, rows, cast, voices, anchors, lex, mood_ref, speaker_anchors(variant, voices), ver=ver)
 
 
 def repick(version: str, name: str):
@@ -176,9 +191,10 @@ def repick(version: str, name: str):
          speaker_anchors(variant, voices), out=WORK / f"{version}-重采样" / name)
 
 
-def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=None, out=None):
+def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=None, out=None, ver=None):
     """full：挑选时"像锚点"和谁比（整段锚点），默认是 voices.yaml 的「平常」。
-    out：成品写到哪（默认和候选同一个目录），候选总是读这一版的 raw/。qc.json 的 take 是挑中的第几个候选。"""
+    out：成品写到哪（默认和候选同一个目录），候选总是读这一版的 raw/。qc.json 的 take 是挑中的第几个候选。
+    ver：11 号票的做法 A/B/C，目标语速乘语速倍数、时长上限按拉长倍数放宽，混音按 gain 加减音量。"""
     from .speaker import SpeakerSim
 
     full = full or speaker_anchors("", voices)
@@ -187,8 +203,11 @@ def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=N
     wav.mkdir(parents=True, exist_ok=True)
     timing = {Path(t["out"]).name: t for t in map(json.loads, (raw / "timing.jsonl").read_text(encoding="utf-8")
                                                   .splitlines()) if "out" in t}
+    marks = perform.load(name) if ver else {}
+    mix_stretch = version.partition("-")[2] in perform.MIX
+    emo_vecs = json.loads((raw / "emo_text.json").read_text(encoding="utf-8")) if (raw / "emo_text.json").exists() else {}
     sp = SpeakerSim()
-    log = {}
+    log, notes = {}, {}
     for r in rows:
         f = wav / f"{r['idx']:04d}.wav"
         text = tts_text(r, lex)
@@ -196,15 +215,20 @@ def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=N
             sf.write(f, np.zeros(int(0.8 * SR), dtype=np.float32), SR)
             continue
         p = plan_row(r, cast, voices, anchors, mood_ref)
+        if ver:
+            p = perform.apply(p, marks[r["idx"]], ver, mix_stretch)
+            notes[r["idx"]] = perform.note(marks[r["idx"]], p, ver, emo_vecs)
         e_anc = sp.embed(full[r["speaker"]])
         cands = []
         for k in range(TAKES):
             a = read_take(raw / f"{r['idx']:04d}-{k}.wav")
+            if p.get("tempo"):  # 语速放混音：先变速再挑
+                a = qc.stretch(a, p["tempo"])
             cands.append((sp.sim(sp.embed_audio(a, SR), e_anc) if len(a) > SR // 2 else 1.0, a))  # 太短的测不准
         used = []  # 按生产时的顺序过一遍：过关就停
         for s, a in cands:
             used.append((s, a))
-            if s >= SIM_LINE and ok(a, text, p, 1.45):
+            if s >= SIM_LINE and ok(a, text, p, 1.45, slow=p.get("slow", 1.0)):
                 break
         passed = [k for k, (s, _) in enumerate(used) if s >= SIM_LINE] or [max(range(len(used)),
                                                                                 key=lambda k: used[k][0])]
@@ -213,10 +237,14 @@ def pick(version, name, rows, cast, voices, anchors, lex, mood_ref=False, full=N
         m.update(take=passed[m.pop("pick")], how=p["how"], tries=len(used), sims=[round(s, 3) for s, _ in cands],
                  secs=round(sum(timing[f"{r['idx']:04d}-{k}.wav"]["secs"] for k in range(len(used))), 2),
                  dur=round(len(a) / SR, 2))
+        if ver:
+            m.update(df=p["df"], gain=marks[r["idx"]]["gain"], target_rate=round(p["rate"], 2))
         sf.write(f, a, SR)
         log[str(r["idx"])] = m
         print(r["idx"], m, flush=True)
     (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
+    if ver:
+        rows = [{**r, "gain": marks[r["idx"]]["gain"], "perf_note": notes.get(r["idx"], "")} for r in rows]
     mix(f"{name}-IndexTTS-{out.parent.name}", rows, cast, wav, out)
 
 

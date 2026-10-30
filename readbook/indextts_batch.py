@@ -6,6 +6,8 @@
   emo_vector?, emo_audio?, emo_alpha}, ...]}：情感向量先过官方的 normalize_emo_vec
   （偏置 + 总和压到 0.8 以下，Python API 不会自己做），use_random=False。
   2.5 用 bf16，2.0 用 fp32。辅助模型（w2v-bert、BigVGAN、CAM++ 等）两版共用 checkpoints/hf_cache。
+  11 号票多两项（只用于 2.5）：duration_factor 照传；emo_text 先交给自带的情感模型（QwenEmotion）转成向量，
+  同一段文字只转一次（固定种子），再和 emo_vector 一样过 normalize_emo_vec，转出来的向量记在 emo_text.json。
 已存在的输出跳过。每条的耗时和时长追加到 jobs.json 旁的 timing.jsonl。
 """
 
@@ -56,13 +58,30 @@ def main(path: Path):
     if not todo:
         return
     t = time.perf_counter()
-    tts = load(version, False)
+    texts = sorted({j["emo_text"] for j in todo if j.get("emo_text")})
+    tts = load(version, bool(texts))
+    emo_file = path.with_name("emo_text.json")
+    emo = json.loads(emo_file.read_text(encoding="utf-8")) if emo_file.exists() else {}
+    load_secs, t = time.perf_counter() - t, time.perf_counter()
+    for s in texts:
+        if s not in emo:
+            torch.manual_seed(0)
+            raw = list(tts.qwen_emo.inference(s).values())
+            emo[s] = [round(x, 4) for x in tts.normalize_emo_vec(raw, apply_bias=True)]
+            print(f"emo_text {s} → {raw} → {emo[s]}", flush=True)
+    if texts:
+        emo_file.write_text(json.dumps(emo, ensure_ascii=False, indent=1), encoding="utf-8")
     timing = path.with_name("timing.jsonl")
     with timing.open("a", encoding="utf-8") as log:
-        log.write(json.dumps({"load_secs": round(time.perf_counter() - t, 2), "version": version}) + "\n")
+        log.write(json.dumps({"load_secs": round(load_secs, 2), "version": version,
+                              "emo_text_secs": round(time.perf_counter() - t, 2), "emo_texts": len(texts)}) + "\n")
         for i, j in enumerate(todo):
             kw = {"lang": "ZH"} if version == "2.5" else {}
-            if j.get("emo_vector"):
+            if j.get("duration_factor"):
+                kw["duration_factor"] = j["duration_factor"]
+            if j.get("emo_text"):
+                kw["emo_vector"] = emo[j["emo_text"]]
+            elif j.get("emo_vector"):
                 kw["emo_vector"] = tts.normalize_emo_vec(j["emo_vector"], apply_bias=True)
             elif j.get("emo_audio"):
                 kw["emo_audio_prompt"] = j["emo_audio"]

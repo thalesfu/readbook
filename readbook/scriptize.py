@@ -100,7 +100,8 @@ def build_prompt(lines: list[dict], cast: dict, blind: bool) -> str:
     return f"{head}\n## 说明\n{note}\n\n## 输入\n" + "\n".join(body)
 
 
-def ask_claude(prompt: str, model: str | None = None, schema: dict = SCHEMA) -> dict:
+def ask_claude(prompt: str, model: str | None = None, schema: dict = SCHEMA, meta: dict | None = None) -> dict:
+    """meta 给了就填进这次调用的用量（耗时、token、费用、模型），算成本用。"""
     cmd = ["claude", "-p", "--output-format", "json", "--no-session-persistence",
            "--json-schema", json.dumps(schema, ensure_ascii=False)]
     if model:
@@ -108,6 +109,8 @@ def ask_claude(prompt: str, model: str | None = None, schema: dict = SCHEMA) -> 
     res = subprocess.run(cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", check=True)
     out = json.loads(res.stdout)
     data = out.get("structured_output") or json.loads(out["result"])
+    if meta is not None:
+        meta.update({k: out[k] for k in ("duration_ms", "total_cost_usd", "usage", "modelUsage") if k in out})
     return data
 
 

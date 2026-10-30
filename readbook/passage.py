@@ -187,7 +187,9 @@ def write_table(name, rows, marks, out):
             "时间戳按带电话效果的那版算，无电话效果版的时间轴相同。", ""]
     if any(r.get("pause") for r in rows):
         head += ["【前停 N 秒】：这句前面隐去了别人的话，混音时在这句前面留出 N 秒空白（剧本的 pause）。", ""]
-    head += ["| 时间 | # | 谁 | 类别 | 情绪 | 效果 | 台词 |", "|---|---|---|---|---|---|---|"]
+    perf = any(r.get("perf_note") for r in rows)  # 11 号票：逐句表演设置多一列
+    head += ["| 时间 | # | 谁 | 类别 | 情绪 | 效果 | 台词 |" + (" 表演 |" if perf else ""),
+             "|---|---|---|---|---|---|---|" + ("---|" if perf else "")]
     body = []
     for r, t in zip(rows, marks):
         text = r["text"].replace("\n", " ").replace("|", "｜")
@@ -196,7 +198,8 @@ def write_table(name, rows, marks, out):
         if r.get("pause"):
             text = f"【前停 {r['pause']:g} 秒】{text}"
         body.append(f"| {stamp(t)} | {r['idx']} | {r['speaker']} | {TYPE[r['type']]} "
-                    f"| {r.get('mood', '')} | {r['effect']} | {text} |")
+                    f"| {r.get('mood', '')} | {r['effect']} | {text} |"
+                    + (f" {r.get('perf_note', '').replace('|', '｜')} |" if perf else ""))
     (out / f"{name} 对照剧本.md").write_text("\n".join(head + body) + "\n", encoding="utf-8", newline="\n")
 
 
