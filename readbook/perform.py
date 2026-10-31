@@ -1,7 +1,8 @@
 """逐句表演设置：拿性格卡、整段场景和标好的剧本，让 LLM 给每句定更细的表演，交给 IndexTTS-2.5。
 
 正式流程（合成规格第三节，生产 02 号票）：剧本化、停顿之后再调一次 `claude -p`（label），每行加
-perform: {vec, tempo, gain}，已有字段一个不动（with_perform）。新剧本在 passage.load_rows 里接上；已有的剧本
+perform: {vec, tempo, gain}，已有字段一个不动（with_perform）。提示词照 11 号票原样（生产 10 号票），LLM 另给的
+strength、emo、why 不进剧本。新剧本在 passage.load_rows 里接上；已有的剧本
 先「标注」到 books/wa2/trials/perform/表演-<剧本>.jsonl 看，认可了再「写回」剧本。定版 2.5-表演B混音 从剧本行读：
 - vec：8 维情感向量，合成时代替按 mood 查表，照旧过 normalize_emo_vec；全 0 就是本人平常的声音；
 - tempo：语速倍数，放混音：合成不拉长，候选读进来先用 atempo 变速，挑选的目标语速也乘它；
@@ -24,6 +25,10 @@ A/B/C 三个试做版照旧读那一份：
     uv run python -m readbook.index_passage 2.5-表演A 小样              # 合成、挑选、混音（B、C、B混音 同）
     uv run python -m readbook.perform 时长 小样|"2010-11-25 〈2002〉"   # 「呼」和轻声：合成拉长 vs 混音变速
     uv run python -m readbook.perform 合集                              # 试听合集：基线 → A → B
+    uv run python -m readbook.perform 变淡标注 加emo    # 生产 10 号票：按改过的提示词（DOSE_PROMPTS）把 02-2011-01-01 标两遍
+    uv run python -m readbook.perform 浓淡 去why-1 加emo-1 …    # 几遍表演设置和 11 号票原版比浓淡
+    uv run python -m readbook.perform 变淡 去why-1      # 小样换成这份表演设置，走定版流程（产物换目录）
+    uv run python -m readbook.perform 变淡对比 去why-1 [加emo-1]   # 和定版差得最多的句子：定版 → 新
 """
 
 import functools
@@ -54,7 +59,18 @@ TEMPO = (0.5, 1.25)
 GAIN = (-9.0, 3.0)
 FIELDS = ("vec", "tempo", "gain")  # 剧本行的 perform 只存这三个
 MODEL = "claude-opus-5-5"  # 11 号票验证时用的；换模型要重新试听
-WHY = False  # 不让 LLM 每行再写一句依据：生产 02 号票比过，留不留差得不比标两遍多，去掉快约 20%（用户定的）
+# 提示词照 11 号票原样，要七个字段（idx、strength、vec、emo、tempo、gain、why），剧本只存 vec、tempo、gain。
+# 生产 02 号票只要三个字段后「平常」的台词情绪淡约三成；10 号票试了加回 emo、明说「平常」加多少，用户试听还是选原样。
+# strength、emo、why 只给 LLM 自己想清楚用，不进剧本；emo="11" 是 11 号票的写法（当时 emo 交给引擎转成向量）
+WHY = True
+EMO = "11"
+STRENGTH = True
+EMO_11 =("- emo：一句不超过 20 字的中文情感描述，交给引擎自带的情感模型转成向量。它只认上面 8 种情绪和浓淡，\n"
+          "  写成「什么情绪、有多浓」，比如「有点难过，又强撑着笑」「压着火，冷冷的」。不需要情绪的行留空。\n")
+# 明说「平常」的台词可以加多少（数取自 11 号票原版：平静中位 0.35，向量总和中位 0.70）
+PLAIN = False
+PLAIN_HINT = ("  「平常」只是说没有明显的情绪，不是没有情绪。多数「平常」的台词仍带着人物当时的一点心情：平静 0.3–0.4 打底，"
+              "再按处境加一两种淡淡的情绪\n  （每种 0.1–0.2），合起来 0.5–0.8；真正照本宣科、毫无情绪的才全填 0。\n")
 
 
 def script_of(name: str) -> str:
@@ -62,10 +78,14 @@ def script_of(name: str) -> str:
     return SEG if name == "小样" else name
 
 
-def schema(why: bool = WHY) -> dict:
-    line = {"idx": {"type": "integer"},
-            "vec": {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8},
-            "tempo": {"type": "number"}, "gain": {"type": "number"}}
+def schema(why: bool = WHY, emo: bool | str = EMO, strength: bool = STRENGTH) -> dict:
+    line = {"idx": {"type": "integer"}}
+    if strength:
+        line["strength"] = {"type": "number"}
+    line["vec"] = {"type": "array", "items": {"type": "number"}, "minItems": 8, "maxItems": 8}
+    if emo:
+        line["emo"] = {"type": "string"}
+    line |= {"tempo": {"type": "number"}, "gain": {"type": "number"}}
     if why:
         line["why"] = {"type": "string"}
     return {"type": "object", "required": ["lines"],
@@ -83,13 +103,13 @@ RULES = """\
 - 现在的做法是按 mood 查一张固定表（「平常」不加向量，就是本人平常的声音）：
 {table}
 - 标了 "mode": "讲述" 的行是叙述者情绪平常的旁白和心理活动，走讲述模式（拿他自己一段讲述录音定情绪，不用向量）。
-  这些行只看 tempo 和 gain，vec 全填 0。
+  这些行只看 tempo 和 gain，{narr_fill}。
 - 只有标点、没有字的行（如「………」）不合成，也按默认值填。
 
 ## 每行要给的
-- vec：8 个 0–1 的数，直接给这一行的情感向量，顺序同上。可以拿上表当起点，按人物和处境调；情绪可以混合，
+{strength}- vec：8 个 0–1 的数，直接给这一行的情感向量，顺序同上。可以拿上表当起点，按人物和处境调；情绪可以混合，
   比如强撑出来的笑意 = 喜 + 忧郁。不需要情绪、就用本人平常声音的行全填 0。
-- tempo：语速倍数，{tempo_lo}–{tempo_hi}，1 = 这个角色平常的语速，整句一起变慢变快。轻声细语、迟疑、叹气要慢；
+{plain}{emo}- tempo：语速倍数，{tempo_lo}–{tempo_hi}，1 = 这个角色平常的语速，整句一起变慢变快。轻声细语、迟疑、叹气要慢；
   着急、慌张可以快。只有一两个字的叹词（「呼」「啊」「嗯」）如果是长长地叹气、拖长了的应声，用 0.5–0.7 把它拉长。
 - gain：音量，单位分贝，{gain_lo:g} 到 +{gain_hi:g}，0 = 平常的响度。轻声、自言自语、耳语要轻（−3 到 −9）；
   喊叫、兴奋可以稍响（最多 +{gain_hi:g}）。
@@ -98,7 +118,7 @@ RULES = """\
 - 先读人物卡，再通读整段，弄清每一行在场景里是什么处境、前后发生了什么，再逐行定。
 - 同一种 mood，人物和处境不同，设置就可以不同：习惯压抑情绪的人难过时更淡、更低、更慢；习惯强撑笑脸的人
   难过时带一点喜；慌乱时快，试探时慢而轻。
-- 已有的 mood 和 instruct 是参考，不要和它们差得太远；拿不准就接近默认值（vec 照表、tempo 1、gain 0）。
+- 已有的 mood 和 instruct 是参考，不要和它们差得太远；拿不准就接近默认值（{defaults}）。
 - 声音效果（电话、回忆）在混音时另加，这里不用管。
 
 ## 人物卡
@@ -127,7 +147,8 @@ def narration(row: dict, cast: dict) -> bool:
         and row.get("mood", "平常") == "平常"
 
 
-def build_prompt(rows: list[dict], cast: dict, why: bool = WHY) -> str:
+def build_prompt(rows: list[dict], cast: dict, why: bool = WHY, emo: bool | str = EMO, strength: bool = STRENGTH,
+                 plain: bool = PLAIN) -> str:
     from .index_passage import EMOTION
 
     table = "\n".join(f"  - {m}：" + ("不加" if v is None else "、".join(f"{d} {x:g}" for d, x in zip(DIMS, v) if x))
@@ -136,7 +157,14 @@ def build_prompt(rows: list[dict], cast: dict, why: bool = WHY) -> str:
     names = list(dict.fromkeys(r["speaker"] for r in rows))
     head = RULES.format(narrator=cast["narrator"], dims="、".join(DIMS), table=table, cards=cards_text(cast, names),
                         tempo_lo=TEMPO[0], tempo_hi=TEMPO[1], gain_lo=GAIN[0], gain_hi=GAIN[1],
-                        why="- why：不超过 25 字，说依据：人物性格、处境、前后文。\n" if why else "")
+                        why="- why：不超过 25 字，说依据：人物性格、处境、前后文。\n" if why else "",
+                        emo=(EMO_11 if emo == "11" else "- emo：一句不超过 20 字的中文情感描述，写成「什么情绪、有多浓」，"
+                             "比如「有点难过，又强撑着笑」「压着火，冷冷的」。不需要情绪的行留空。\n") if emo else "",
+                        strength="- strength：0–1，查表那个向量用几成（1 = 表里的原值）。mood 是「平常」的行填 1。\n"
+                                 if strength else "",
+                        plain=PLAIN_HINT if plain else "",
+                        narr_fill="、".join(["strength 填 1"] * strength + ["vec 全填 0"] + ["emo 留空"] * bool(emo)),
+                        defaults="、".join(["strength 1"] * strength + ["vec 照表", "tempo 1", "gain 0"]))
     body = []
     for r in rows:
         x = {k: r[k] for k in ("idx", "type", "speaker", "effect", "mood", "instruct", "text")}
@@ -152,17 +180,20 @@ def clean(m: dict) -> dict:
     clip = lambda x, lo, hi: min(max(float(x), lo), hi)  # noqa: E731
     out = {"idx": m["idx"], "vec": [round(clip(x, 0, 1), 2) for x in m["vec"]],
            "tempo": round(clip(m["tempo"], *TEMPO), 2), "gain": round(clip(m["gain"], *GAIN), 1)}
-    if "why" in m:
-        out["why"] = m["why"]
+    if "strength" in m:
+        out["strength"] = round(clip(m["strength"], 0, 1), 2)
+    for k in ("emo", "why"):
+        if k in m:
+            out[k] = m[k].strip()
     return out
 
 
-def label(rows: list[dict], cast: dict, model: str | None = MODEL, why: bool = WHY,
-          meta: dict | None = None) -> dict[int, dict]:
-    """标好停顿的剧本整份交给 claude -p → {idx: {idx, vec, tempo, gain[, why]}}，一行不漏。
+def label(rows: list[dict], cast: dict, model: str | None = MODEL, why: bool = WHY, emo: bool | str = EMO,
+          strength: bool = STRENGTH, plain: bool = PLAIN, meta: dict | None = None) -> dict[int, dict]:
+    """标好停顿的剧本整份交给 claude -p → {idx: {idx, vec, tempo, gain[, strength][, emo][, why]}}，一行不漏。
     meta 给了就填进这次调用的用量和提示、返回的字数，算成本用。"""
-    prompt = build_prompt(rows, cast, why)
-    data = ask_claude(prompt, model, schema(why), meta)
+    prompt = build_prompt(rows, cast, why, emo, strength, plain)
+    data = ask_claude(prompt, model, schema(why, emo, strength), meta)
     got = {m["idx"]: clean(m) for m in data["lines"]}
     missing = [r["idx"] for r in rows if r["idx"] not in got]
     if missing:
@@ -432,7 +463,8 @@ def why_ab(name: str, n: int = 2):
         f = WHY_AB / f"{script}-{tag}.jsonl"
         if not f.exists():
             meta = {}
-            write_jsonl(f, list(label(rows, cast, why=tag.startswith("留"), meta=meta).values()))
+            write_jsonl(f, list(label(rows, cast, why=tag.startswith("留"), emo=False, strength=False,
+                                      meta=meta).values()))
             with cost.open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"script": script, "run": tag, "lines": len(rows), **meta}, ensure_ascii=False) + "\n")
         return {m["idx"]: m for m in read_jsonl(f)}
@@ -493,6 +525,217 @@ def why_ab(name: str, n: int = 2):
     print(md)
 
 
+# ---------- 变淡：换一份表演设置做小样（生产 10 号票） ----------
+
+DOSE = PERF / "intensity"
+DOSE_VERSION = "2.5-表演B混音"
+DOSE_BASE = "2.5-表演B混音-剧本"  # 定版：剧本里的设置（11 号票原版）、01 号票的挑选规则
+DOSE_TAKES = ("2.5-表演B混音-按轮", "2.5-表演B混音")  # 现成的候选
+BIAS = [0.9375, 0.875, 1.0, 1.0, 0.9375, 0.9375, 0.6875, 0.5625]  # IndexTTS 的 normalize_emo_vec
+
+
+def engine_vec(v: list[float]) -> list[float]:
+    """引擎实际用的情感向量：乘偏置，总和压到 0.8 以内（同 normalize_emo_vec）。"""
+    v = [x * b for x, b in zip(v, BIAS)]
+    return [x * 0.8 / sum(v) for x in v] if sum(v) > 0.8 else v
+
+
+def dose_marks(tag: str) -> dict[int, dict]:
+    """02-2011-01-01-<tag>.jsonl：这张票重标的放 intensity/，02 号票那四遍在 why/。"""
+    f = next(f for d in (DOSE, WHY_AB) if (f := d / f"{SEG}-{tag}.jsonl").exists())
+    return {m["idx"]: m for m in read_jsonl(f)}
+
+
+DOSE_PROMPT0 = {"why": False, "emo": False, "strength": False, "plain": False}  # 02 号票的提示词（去why），改法在它上面改
+DOSE_PROMPTS = {"加emo": {"emo": True},"加emo和strength": {"emo": True, "strength": True},  # 提示词改法 → label 的参数
+                "明说平常": {"plain": True}, "加emo和明说平常": {"emo": True, "plain": True},
+                "11号原提示词": {"emo": "11", "strength": True, "why": True}}
+
+
+def dose_label(how: str, n: int = 2):
+    """按 DOSE_PROMPTS[how] 改过的提示词把 02-2011-01-01 整份标 n 遍（并行），写 intensity/02-2011-01-01-<how>-<i>.jsonl，
+    用量追加到 intensity/成本.jsonl；已有的不重标。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    rows = read_jsonl(BOOK / "script" / f"{SEG}.jsonl")
+    cast = load_cast(BOOK / "cast.yaml")
+    DOSE.mkdir(parents=True, exist_ok=True)
+
+    def one(tag: str):
+        f = DOSE / f"{SEG}-{tag}.jsonl"
+        if not f.exists():
+            meta = {}
+            write_jsonl(f, list(label(rows, cast, meta=meta, **(DOSE_PROMPT0 | DOSE_PROMPTS[how])).values()))
+            with (DOSE / "成本.jsonl").open("a", encoding="utf-8") as log:
+                log.write(json.dumps({"script": SEG, "run": tag, "lines": len(rows), **meta}, ensure_ascii=False) + "\n")
+
+    with ThreadPoolExecutor(n) as ex:
+        list(ex.map(one, [f"{how}-{i + 1}" for i in range(n)]))
+
+
+def dose_stats(tags: list[str]):
+    """02-2011-01-01 整份的几遍表演设置和 11 号票原版比浓淡（引擎实际用的 vec），写 intensity/02-2011-01-01-浓淡.md。"""
+    rows = read_jsonl(BOOK / "script" / f"{SEG}.jsonl")
+    cast = load_cast(BOOK / "cast.yaml")
+    runs = {"原版": load(SEG), **{t: dose_marks(t) for t in tags}}
+    spoken = [r for r in rows if qc.SPOKEN.search(r["text"])]
+    acted = [r for r in spoken if not narration(r, cast)]
+    plain = [r["idx"] for r in acted if r["mood"] == "平常"]
+    other = [r["idx"] for r in acted if r["mood"] != "平常"]
+    eng = lambda t, i: engine_vec(runs[t][i]["vec"])  # noqa: E731
+    cost = {m["run"]: m for f in (WHY_AB / "成本.jsonl", DOSE / "成本.jsonl") if f.exists() for m in read_jsonl(f)}
+    lines = [f"# 表演设置的浓淡（{SEG}）", "",
+             f"整份剧本 {len(rows)} 行，vec 起作用的（有字要念、不走讲述模式）{len(acted)} 行：「平常」{len(plain)} 行、"
+             f"其他情绪 {len(other)} 行。浓度 = 引擎实际用的 vec（乘偏置、总和压到 0.8 以内）的总和，按行平均；"
+             "和原版差 = 引擎实际用的 vec 逐维差的绝对值加起来，按行平均。原版是 11 号票试做那一份（七个字段），"
+             "去why 是生产 02 号票的提示词（三个字段）；这张票的改法（DOSE_PROMPTS）：加emo 把情感描述加回提示，"
+             "加emo和strength 再加回 strength，明说平常 在提示里明说「平常」的台词加多少，11号原提示词 是 11 号票的提示词"
+             "一字不改。剧本都只存三个字段。", "",
+             "| 哪一遍 | 浓度·平常 | 浓度·其他 | 平常里全 0 | 和原版差·平常 | 和原版差·其他 | 平静·平常 | tempo 平均 | gain 平均 "
+             "| 费用 | 耗时 | 输出 token |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for t in runs:
+        m = cost.get(t)
+        far = lambda ids: np.mean([sum(abs(x - y) for x, y in zip(eng(t, i), eng("原版", i))) for i in ids])  # noqa: E731
+        lines.append(f"| {t} | {np.mean([sum(eng(t, i)) for i in plain]):.3f} | {np.mean([sum(eng(t, i)) for i in other]):.3f} "
+                     f"| {sum(sum(runs[t][i]['vec']) == 0 for i in plain)} | {far(plain):.3f} | {far(other):.3f} "
+                     f"| {np.mean([eng(t, i)[7] for i in plain]):.3f} "
+                     f"| {np.mean([runs[t][r['idx']]['tempo'] for r in spoken]):.3f} "
+                     f"| {np.mean([runs[t][r['idx']]['gain'] for r in spoken]):+.2f} "
+                     + (f"| ${m['total_cost_usd']:.2f} | {m['duration_ms'] / 1000:.0f} 秒 | {m['usage']['output_tokens']} |"
+                        if m else "| — | — | — |"))
+    md = DOSE / f"{SEG}-浓淡.md"
+    md.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    print(md)
+    print("\n".join(lines[-len(runs):]))
+
+
+def dose_rows(tag: str, name: str = "小样") -> list[dict]:
+    """小样的剧本行，perform 换成 <tag> 那一份；剧本文件不动。"""
+    from .passage import load_rows
+
+    return with_perform(load_rows(name, None, None, None), dose_marks(tag), load_cast(BOOK / "cast.yaml"))
+
+
+def known_takes(name: str) -> dict[tuple, dict]:
+    """DOSE_TAKES 和以前几次「变淡」现成的候选 {job_key: 任务 + 耗时}：按轮生成的任务在 <版本>/轮次/，
+    以前的在 <名字>/raw/jobs.json。"""
+    from . import index_passage as ip
+
+    have = {}
+    tried = [d.name for d in sorted(ip.WORK.glob(f"{DOSE_VERSION}-*"))  # 别的票的版本（比如改了读音的）不算
+             if any((x / f"{SEG}-{d.name.removeprefix(DOSE_VERSION + '-')}.jsonl").exists() for x in (DOSE, WHY_AB))]
+    for v in [*DOSE_TAKES, *tried]:
+        raw = ip.WORK / v / name / "raw"
+        if not (raw / "timing.jsonl").exists():  # 只重挑、不生成的版本没有候选
+            continue
+        timing = {t["out"]: t for t in map(json.loads, (raw / "timing.jsonl").read_text(encoding="utf-8").splitlines())
+                  if "out" in t}
+        for f in [raw / "jobs.json", *sorted((ip.WORK / v / "轮次").glob("第*轮.json"))]:
+            if f.exists():
+                for j in json.loads(f.read_text(encoding="utf-8"))["jobs"]:
+                    if j["out"] in timing and Path(j["out"]).exists():
+                        have.setdefault(job_key(j), {**j, "timing": timing[j["out"]]})
+    return have
+
+
+def dose_build(tag: str, name: str = "小样"):
+    """按定版 2.5-表演B混音 的流程（按轮生成、挑选、混音）做一遍，只把表演设置换成 <tag> 那一份，
+    产物在 out/index/2.5-表演B混音-<tag>/。合成的文字照定版的任务（读音表以后会改，不让它混进来）。
+    种子固定，任务和现成候选一样的（vec 没变的句子）先拷过来，不重新合成；语速变了的照样重新判、重新挑。"""
+    from unittest import mock
+
+    from . import index_passage as ip
+    from .passage import load_voices
+
+    rows = dose_rows(tag, name)
+    have = known_takes(name)
+    said = {b["seed"] // 100: b["text"] for b in have.values()}
+    work = ip.WORK / f"{DOSE_VERSION}-{tag}"
+    raw = work / name / "raw"
+    raw.mkdir(parents=True, exist_ok=True)
+    with mock.patch.object(ip, "load_rows", lambda *_: rows), \
+            mock.patch.object(ip, "tts_text", lambda r, lex: said.get(r["idx"]) or tts_text(r, lex)):
+        voices = load_voices()
+        _, todo = ip.plan(DOSE_VERSION.partition("-")[2], name, load_cast(BOOK / "cast.yaml"), voices,
+                          ip.clipped_anchors(DOSE_VERSION.partition("-")[2], voices), load_yaml(BOOK / "lexicon.yaml"))
+        n = 0
+        with (raw / "timing.jsonl").open("a", encoding="utf-8") as log:
+            for s in todo.values():
+                for k in range(ip.TAKES + ip.EXTRA):
+                    j = ip.job(raw, s, k)
+                    b = have.get(job_key(j))
+                    if b and not Path(j["out"]).exists():
+                        shutil.copyfile(b["out"], j["out"])
+                        log.write(json.dumps({**b["timing"], "out": j["out"], "reused": b["out"]}, ensure_ascii=False)
+                                  + "\n")
+                        n += 1
+        print(f"拿现成的候选 {n} 个", flush=True)
+        ip.run(DOSE_VERSION, [name], work, work, generate=True)
+
+
+def dose_compare(tags: list[str], n: int = 12, name: str = "小样"):
+    """引擎实际用的 vec 和定版差得最多的 n 句（几版里取差得最多的那一版算），每句按 定版 → <tag>… 连放，
+    拼成一个 MP3 和一张时间表，放 trials/perform/intensity/。混音同正式流程，每遍各按自己的 gain。"""
+    from . import index_passage as ip
+    from .mix import SR, db, process, to_mp3
+    from .passage import load_rows, stamp
+    import soundfile as sf
+
+    cast = load_cast(BOOK / "cast.yaml")
+    rows = {"定版": {r["idx"]: r for r in load_rows(name, None, None, None)},
+            **{t: {r["idx"]: r for r in dose_rows(t, name)} for t in tags}}
+    dirs = {"定版": ip.WORK / DOSE_BASE / name, **{t: ip.WORK / f"{DOSE_VERSION}-{t}" / name for t in tags}}
+    q = {k: {int(i): m for i, m in json.loads((d / "qc.json").read_text(encoding="utf-8")).items()}
+         for k, d in dirs.items()}
+    l1 = lambda a, b: sum(abs(x - y) for x, y in zip(a, b))  # noqa: E731
+    vec = lambda k, i: engine_vec(rows[k][i]["perform"]["vec"])  # noqa: E731
+    acted = [i for i in q["定版"] if not narration(rows["定版"][i], cast)]
+    far = sorted(acted, key=lambda i: -max(l1(vec("定版", i), vec(t, i)) for t in tags))[:n]
+    gap_in, gap_out = 0.7, 2.0
+    chunks, pos, table = [], 0.0, []
+    for i in sorted(far):
+        r = rows["定版"][i]
+        pan = cast["characters"].get(r["speaker"], {}).get("pan", 0.0)
+        starts = []
+        for k, v in enumerate(dirs):
+            x = sf.read(dirs[v] / "wav" / f"{i:04d}.wav", dtype="float32")[0]
+            st = db(process(x, r, pan, True), rows[v][i]["perform"]["gain"]).astype(np.float32)
+            g = gap_in if k < len(tags) else gap_out
+            starts.append(stamp(pos))
+            chunks += [st, np.zeros((int(g * SR), 2), dtype=np.float32)]
+            pos += len(st) / SR + g
+        ps = [rows[v][i]["perform"] for v in dirs]
+        cells = [[vec_text(vec(v, i)) for v in dirs], [f"{sum(vec(v, i)):.2f}" for v in dirs],
+                 [f"×{p['tempo']:g}" for p in ps], [f"{p['gain']:+g}" for p in ps], [str(q[v][i]["take"]) for v in dirs]]
+        text = r["text"].replace("\n", " ").replace("|", "｜")
+        table.append(f"| {' | '.join(starts)} | {i} | {r['speaker']} | {r['mood']} | {text} | "
+                     + " | ".join(" → ".join(c) for c in cells) + " |")
+    out = np.concatenate(chunks)
+    out *= min(1.0, 0.97 / float(np.abs(out).max()))
+    title = f"{name}-{'-'.join(tags)}-新旧对比"
+    mp3 = DOSE / f"{title}.mp3"
+    to_mp3(out, mp3, {"album": "白色相簿2 剧本全集（试做）", "title": title, "artist": "AI 有声书试做"})
+
+    def mean(pick) -> str:
+        ids = [i for i in acted if pick(rows["定版"][i])]
+        return " → ".join(f"{np.mean([sum(vec(v, i)) for i in ids]):.2f}" for v in dirs) + f"（{len(ids)} 句）"
+
+    plain = lambda r: r["mood"] == "平常"  # noqa: E731
+    order = " → ".join(dirs)
+    head = [f"# {name}：表演设置 {order}", "",
+            f"`{DOSE_BASE}`（剧本里的设置，11 号票原版）和 "
+            + "、".join(f"`{DOSE_VERSION}-{t}`（只把表演设置换成 `{SEG}-{t}.jsonl`）" for t in tags)
+            + f"比，引擎实际用的情感向量（乘偏置、总和压到 0.8 以内）和定版差得最多的 {len(far)} 句，每句连放：{order}。"
+            f"同一句几遍之间隔 {gap_in:g} 秒，换句隔 {gap_out:g} 秒。混音同正式流程，各按自己的音量。"
+            "候选是第几号（种子 = 句号 × 100 + 候选号）。",
+            "", f"情绪浓度（引擎实际用的 vec 总和，按句平均，{order}）：「平常」的台词 {mean(plain)}；"
+            f"其他情绪 {mean(lambda r: not plain(r))}。", "",
+            f"| {' | '.join(dirs)} | # | 谁 | 情绪 | 台词 | 情感向量（引擎实际用的） | 浓度 | 语速 | 音量 dB | 候选 |",
+            "|---" * (len(dirs) + 9) + "|"]
+    (DOSE / f"{title}.md").write_text("\n".join(head + table) + "\n", encoding="utf-8", newline="\n")
+    print(mp3, f"{len(out) / SR / 60:.1f} 分钟，{len(table)} 句")
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "标注":
         cmd_label(sys.argv[2])
@@ -504,3 +747,11 @@ if __name__ == "__main__":
         duration_ab(sys.argv[2])
     elif sys.argv[1] == "合集":
         sampler()
+    elif sys.argv[1] == "变淡":
+        dose_build(sys.argv[2])
+    elif sys.argv[1] == "变淡对比":
+        dose_compare(sys.argv[2:])
+    elif sys.argv[1] == "变淡标注":
+        dose_label(sys.argv[2])
+    elif sys.argv[1] == "浓淡":
+        dose_stats(sys.argv[2:])
