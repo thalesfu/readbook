@@ -33,6 +33,8 @@
   第一个两样都过的就停（more）。TAKES 轮都没过关的，在过了音色门槛的候选里挑偏差最小的（bakeoff.finish）；
   一个都没过音色门槛的再补最多 EXTRA 轮，有一个过了就停，还不过就取像原声最高的，记进复核清单。挑中的语速拉回
   目标的 0.85–1.2 倍。种子和顺序不变，所以挑出来的和"一次生成 TAKES 个再按顺序挑"一样；
+- 读音（生产 03 号票）：不参与挑选。挑中的每句用 Whisper 识别回文字，按带声调的拼音和原文比（pronounce），
+  拼音错率超过 pronounce.MISREAD 的记进复核清单；
 - 合成在 IndexTTS 自己的环境里跑（indextts_batch.py），这边负责出任务、挑选、混音；
 - 产物在 out/index/<版本>/<名字>/：raw/ 候选和 timing.jsonl、wav/ 成品、qc.json、MP3、对照剧本、复核清单；
   每轮的任务和加载耗时在 out/index/<版本>/轮次/，各轮的生成、加载、挑选耗时汇总在 轮次/耗时.jsonl。
@@ -53,6 +55,7 @@ from .bakeoff import SIM_LINE, finish, ok
 from .config import INDEX_DIR
 from .moods import NARRATION
 from .passage import load_rows, load_voices, mix, stamp
+from .pronounce import MISREAD, misread, unknown
 from .scriptize import load_cast
 from .synth import load_yaml, tts_text
 from .trial import BOOK, OUT
@@ -256,6 +259,7 @@ def run(version: str, names: list[str], src: Path, dst: Path, generate: bool):
 
     model, _, variant = version.partition("-")
     cast, voices, lex = load_cast(BOOK / "cast.yaml"), load_voices(), load_yaml(BOOK / "lexicon.yaml")
+    assert not (bad := unknown(lex)), f"读音表里有 IndexTTS 不认的拼音标注：{bad}"
     anchors = clipped_anchors(variant, voices)
     plans = {n: plan(variant, n, cast, voices, anchors, lex) for n in names}
     raw = {n: src / n / "raw" for n in names}
@@ -287,17 +291,21 @@ def run(version: str, names: list[str], src: Path, dst: Path, generate: bool):
         for n, s in due:
             s["cands"].append(judge(sp, take(raw[n], s, k), s, gates[s["row"]["speaker"]]))
         record(rec | {"judge": round(time.perf_counter() - t, 1)})
+    from .asrcheck import TorchWhisper
+
+    whisper = TorchWhisper()
     for n, (rows, todo) in plans.items():
-        record({"name": n, **pick(version, n, rows, todo, cast, gates, raw[n], dst / n)})
+        record({"name": n, **pick(version, n, rows, todo, cast, gates, raw[n], dst / n, whisper)})
 
 
-def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gates: dict, raw: Path, out: Path) -> dict:
+def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gates: dict, raw: Path, out: Path,
+         whisper) -> dict:
     """一段的挑选和混音，候选已经按 more 判好。在过了音色门槛的候选里挑偏差最小的（bakeoff.finish；过关就停的
-    句子里通常就是最后那个过关的）；一个都没过的取像原声最高的。语速拉回目标，写 wav、qc.json、MP3、对照剧本、
-    复核清单，返回挑选和混音各花了几秒。
+    句子里通常就是最后那个过关的）；一个都没过的取像原声最高的。语速拉回目标，写 wav；挑中的再识别一遍（hear）；
+    写 qc.json、MP3、对照剧本、复核清单，返回挑选、识别和混音各花了几秒。
     qc.json 的 take 是挑中第几个候选；sims 是每个候选的像原声（短句不查，记 null），voice、ok 是过没过音色门槛、
-    质检，gate 是本人的音色门槛，fallback 表示补完轮次还没过音色门槛。有表演设置的句子另记 df、gain、target_rate。
-    rows 是 plan 给的，带着这一版用的表演设置。"""
+    质检，gate 是本人的音色门槛，fallback 表示补完轮次还没过音色门槛；hyp、misread 是识别结果和拼音错率。
+    有表演设置的句子另记 df、gain、target_rate。rows 是 plan 给的，带着这一版用的表演设置。"""
     ver = perform.VERSIONS.get(version.partition("-")[2])
     timing = {t["out"]: t for t in map(json.loads, (raw / "timing.jsonl").read_text(encoding="utf-8").splitlines())
               if "out" in t}
@@ -334,8 +342,11 @@ def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gate
         sf.write(f, a, SR)
         log[str(r["idx"])] = m
         print(r["idx"], m, flush=True)
-    (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
     secs = {"pick": round(time.perf_counter() - t, 1)}
+    t = time.perf_counter()
+    hear(whisper, todo, log, wav)
+    (out / "qc.json").write_text(json.dumps(log, ensure_ascii=False, indent=1), encoding="utf-8")
+    secs["hear"] = round(time.perf_counter() - t, 1)
     t = time.perf_counter()
     if notes:
         rows = [{**r, "perf_note": notes.get(r["idx"], "")} for r in rows]
@@ -345,9 +356,22 @@ def pick(version: str, name: str, rows: list[dict], todo: dict, cast: dict, gate
     return secs | {"mix": round(time.perf_counter() - t, 1)}
 
 
+def hear(whisper, todo: dict, log: dict, wav: Path):
+    """读音（合成规格第六节）：挑中的每句用 Whisper 识别回文字，和送进 TTS 的文本按带声调的拼音比
+    （pronounce.misread），识别结果和拼音错率记进 log（qc.json）。不到 2 个字的（「………」「呃…」）不查。"""
+    lex = load_yaml(BOOK / "lexicon.yaml")
+    for i, m in log.items():
+        text = todo[int(i)]["text"]
+        if len(qc.SPOKEN.findall(text)) < 2:
+            continue
+        hyp = whisper.transcribe_audio(sf.read(wav / f"{int(i):04d}.wav", dtype="float32")[0], SR)
+        m.update(hyp=hyp, misread=round(misread(text, hyp, lex), 3))
+
+
 def write_review(title: str, rows: list[dict], starts: list[float], log: dict, out: Path):
-    """复核清单的音色部分（合成规格第六节）：补完轮次还没过音色门槛、取了像原声最高的候选的句子。
-    和对照剧本放在一起，时间对得上对照剧本。读音部分由生产 03 号票补。"""
+    """复核清单（合成规格第六节），和对照剧本放在一起，时间对得上对照剧本：
+    - 音色：补完轮次还没过音色门槛、取了像原声最高的候选的句子；
+    - 读音：挑中的句子拼音错率超过 MISREAD 的（hear）。"""
     at = {r["idx"]: t for r, t in zip(rows, starts)}
     extra = [r for r in rows if log.get(str(r["idx"]), {}).get("tries", 0) > TAKES]
     bad = [r for r in extra if log[str(r["idx"])]["fallback"]]
@@ -361,6 +385,19 @@ def write_review(title: str, rows: list[dict], starts: list[float], log: dict, o
             text = r["text"].replace("\n", " ").replace("|", "｜")
             lines.append(f"| {stamp(at[r['idx']])} | {r['idx']} | {r['speaker']} | {text} "
                          f"| {m['sims'][m['take']]:.3f} | {m['gate']:.3f} |")
+    else:
+        lines.append("没有。")
+    wrong = [r for r in rows if log.get(str(r["idx"]), {}).get("misread", 0) > MISREAD]
+    lines += ["", "## 读音", "",
+              "挑中的句子用 Whisper 识别回文字，和原文都转成带声调的拼音再比：同音字不算错，读音表标注过的字按标注。"
+              f"下面是拼音错率超过 {MISREAD:g} 的，哭腔、喊叫、拟声词识别不准也会进来，要听了再定。", ""]
+    if wrong:
+        lines += ["| 时间 | # | 谁 | 台词 | 识别 | 拼音错率 |", "|---|---|---|---|---|---|"]
+        for r in wrong:
+            m = log[str(r["idx"])]
+            cells = [x.replace("\n", " ").replace("|", "｜") for x in (r["text"], m["hyp"])]
+            lines.append(f"| {stamp(at[r['idx']])} | {r['idx']} | {r['speaker']} | {cells[0]} | {cells[1]} "
+                         f"| {m['misread']:.2f} |")
     else:
         lines.append("没有。")
     (out / f"{title} 复核清单.md").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")

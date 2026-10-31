@@ -25,6 +25,7 @@ dependencies = [
     # transformers 4.57.3 要 huggingface_hub <1.0，mlx-audio 要 ≥1.0：分平台写，uv 才会分开解
     "huggingface-hub<1.0 ; sys_platform == 'win32'",
     "huggingface-hub>=1.0 ; sys_platform == 'darwin'",
+    "pypinyin>=0.55.0",
 ]
 
 [[tool.uv.index]]

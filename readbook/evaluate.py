@@ -19,7 +19,9 @@
 - 认人准确率：离四个人的锚点哪个最近；另附按原声中心算的；
 - 不到 1.5 秒的句子单独统计：声纹模型在短句上测不准；
 - 情感 × 音色：emotion2vec+ large 给每句识别情绪，看每种情绪下的相似度；另附按剧本标注情绪分的；
-- 识别字错率（Whisper large-v3-turbo）、音高和语速范围、句内变调，沿用以前的做法。
+- 读音：Whisper large-v3-turbo 识别回文字，和送进 TTS 的文本都转成带声调的拼音再比（pronounce.misread，
+  生产 03 号票），同音字不算错；以前的字错率也照算，只记在逐句明细里；
+- 音高和语速范围、句内变调，沿用以前的做法。
 春希的旁白和心里话（讲述模式）单列一组。
 """
 
@@ -36,10 +38,11 @@ import soundfile as sf
 import yaml
 
 from . import qc
-from .asrcheck import PUNCT, TorchWhisper, cer
+from .asrcheck import TorchWhisper, cer
 from .bakeoff import sample_rows
 from .config import ROOT, hf_model
 from .mix import IR, gap
+from .pronounce import MISREAD, misread, plain
 from .scriptize import load_cast
 from .speaker import SpeakerSim
 from .synth import SILENCE, load_yaml, tts_text
@@ -274,9 +277,9 @@ def evaluate(rows: list[dict], audio: dict[int, np.ndarray], starts: dict[int, f
             rec["start"] = round(starts[r["idx"]], 2)
         rec["dur"] = round(qc.speech_seconds(a), 2)
         rec["emotion"], rec["emotion_score"] = emotion(a)
-        if len(PUNCT.sub("", text)) >= 2:  # "………"、"呃…" 这类不查
+        if len(qc.SPOKEN.findall(text)) >= 2:  # "………"、"呃…" 这类不查
             hyp = whisper.transcribe_audio(a, SR)
-            rec |= {"hyp": hyp, "cer": round(cer(text, hyp), 3)}
+            rec |= {"hyp": hyp, "misread": round(misread(text, hyp, lex), 3), "cer": round(cer(plain(text), hyp), 3)}
         if r["speaker"] in names:
             e = sp.embed_audio(a, SR)
             f, rt = qc.f0_median(a), qc.rate(a, text)
@@ -363,21 +366,23 @@ def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gate
             f"{ratio(sum(r['near_real'] == r['speaker'] for r in voiced), len(voiced))}。"]
 
     out += ["", "## 读音和韵律", "",
-            "字错率：Whisper large-v3-turbo 识别回文字，对照送进 TTS 的文本（已按读音表替换），不到 2 个字的不算。"
+            "拼音错率：Whisper large-v3-turbo 识别回文字，和送进 TTS 的文本（已按读音表替换）都转成带声调的拼音，"
+            "按音节算编辑距离，除以原文音节数；同音字不算错，读音表标注过的字按标注；不到 2 个字的不算。"
             "句内变调：半秒一段估音高，最高一段超过目标（定妆音平常的音高）1.45 倍。", "",
-            "| 组 | 句数 | 字错率 中位 | 字错率 >0.3 | 音高 Hz 中位（P10–P90） | 语速 字/秒 中位（P10–P90） | 句内变调 |",
+            f"| 组 | 句数 | 拼音错率 中位 | 拼音错率 >{MISREAD:g} | 音高 Hz 中位（P10–P90） | 语速 字/秒 中位（P10–P90） "
+            "| 句内变调 |",
             "|---|---|---|---|---|---|---|"]
     for g in groups + ["合计"]:
         sel = voiced if g == "合计" else [r for r in voiced if group(r) == g]
-        cers = [r["cer"] for r in sel if r.get("cer") is not None]
+        errs = [r["misread"] for r in sel if r.get("misread") is not None]
         f0 = "—" if g == "合计" else spread([r["f0"] for r in sel], ".0f")
         rt = "—" if g == "合计" else spread([r["rate"] for r in sel], ".1f")
-        cm = f"{np.median(cers):.3f}" if cers else "—"
-        out.append(f"| {g} | {len(sel)} | {cm} | {sum(x > 0.3 for x in cers)} | {f0} | {rt} "
+        em = f"{np.median(errs):.3f}" if errs else "—"
+        out.append(f"| {g} | {len(sel)} | {em} | {sum(x > MISREAD for x in errs)} | {f0} | {rt} "
                    f"| {sum(r['jump'] > 1.45 for r in sel)} |")
-    others = [r for r in recs if r["speaker"] not in names and r.get("cer") is not None]
+    others = [r for r in recs if r["speaker"] not in names and r.get("misread") is not None]
     if others:
-        out.append(f"\n其他说话人 {len(others)} 句，字错率中位 {np.median([r['cer'] for r in others]):.3f}。")
+        out.append(f"\n其他说话人 {len(others)} 句，拼音错率中位 {np.median([r['misread'] for r in others]):.3f}。")
 
     for key, label in (("emotion", " emotion2vec+ 识别的情绪"), ("mood", "剧本标注的情绪")):
         cats = sorted({r[key] for r in long_}, key=lambda m: -sum(r[key] == m for r in long_))
@@ -391,16 +396,18 @@ def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gate
                 cells.append(f"{np.median(xs):.2f}（{len(xs)}）" if xs else "")
             out.append(f"| {m} | " + " | ".join(cells) + " |")
 
-    bad = [r for r in recs if (r.get("cer") or 0) > 0.3]
+    bad = [r for r in recs if (r.get("misread") or 0) > MISREAD]
     if bad:
-        out += ["", "## 字错率 >0.3 的句子", "", "| # | 谁 | 字错率 | 原文 | 识别 |", "|---|---|---|---|---|"]
+        out += ["", f"## 拼音错率 >{MISREAD:g} 的句子", "", "| # | 谁 | 拼音错率 | 字错率 | 原文 | 识别 |",
+                "|---|---|---|---|---|---|"]
         for r in bad:
-            out.append(f"| {r['idx']} | {r['speaker']} | {r['cer']:.2f} | {cell(r['text'])} | {cell(r['hyp'])} |")
+            out.append(f"| {r['idx']} | {r['speaker']} | {r['misread']:.2f} | {r['cer']:.2f} | {cell(r['text'])} "
+                       f"| {cell(r['hyp'])} |")
 
     timed = any("start" in r for r in recs)
     out += ["", "## 逐句", "",
             "像原声低于门槛的标 ✗；* 是不到 1.5 秒的短句。最近＝离哪个人的锚点最近。", "",
-            ("| 时间 " if timed else "") + "| # | 谁 | 类别 | 剧本情绪 | 识别情绪 | 秒 | 像原声 | 像锚点 | 最近 | 字错率 | 台词 |",
+            ("| 时间 " if timed else "") + "| # | 谁 | 类别 | 剧本情绪 | 识别情绪 | 秒 | 像原声 | 像锚点 | 最近 | 拼音错率 | 台词 |",
             ("|---" if timed else "") + "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in recs:
         t = f"| {int(r['start'] // 60)}:{r['start'] % 60:04.1f} " if timed else ""
@@ -409,7 +416,7 @@ def report(title: str, src: Path, how: str, recs: list[dict], voices: dict, gate
             sim = f"{r['sim_real']:.2f}" + (" ✗" if r["sim_real"] < gate[r["speaker"]] else "")
             anc, near = f"{r['sim_anchor']:.2f}", r["near_anchor"]
         dur = f"{r['dur']:.1f}" + ("*" if r["dur"] < SHORT else "")
-        c = f"{r['cer']:.2f}" if r.get("cer") is not None else ""
+        c = f"{r['misread']:.2f}" if r.get("misread") is not None else ""
         out.append(f"{t}| {r['idx']} | {r['speaker']} | {r['type']} | {r['mood']} | {r['emotion']} | {dur} "
                    f"| {sim} | {anc} | {near} | {c} | {cell(r['text'])} |")
     return "\n".join(out) + "\n"

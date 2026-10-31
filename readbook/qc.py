@@ -12,7 +12,9 @@ import numpy as np
 import soundfile as sf
 
 SR = 48000
-SPOKEN = re.compile(r"[\w]", re.U)
+# 念出来的字，字数都按它数（语速、时长上限、生成上限）。读音表的拼音标注 <字|拼音声调> 只算那个字：
+# 后面紧跟着「不含 < > | 的一串再接 >」的，是标注里的拼音，不算
+SPOKEN = re.compile(r"\w(?![^<>|]*>)", re.U)
 
 
 def f0_median(a: np.ndarray, sr: int = SR) -> float | None:

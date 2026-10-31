@@ -17,13 +17,14 @@ import numpy as np
 import soundfile as sf
 import yaml
 
+from .qc import SPOKEN
+
 SR = 48000
 VOXCPM = "mlx-community/VoxCPM2-bf16"
 QWEN_DESIGN = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
 POOL_SAMPLE = "今天的天气不错，我们一起出去走走吧。这件事情说来话长，你先坐下，听我慢慢讲。"
 
 
-SPOKEN = re.compile(r"[\w]", re.U)
 SILENCE = 0.8
 
 
@@ -52,11 +53,13 @@ class Voice:
 
 def tts_text(row: dict, lexicon: dict[str, str]) -> str:
     """台词去掉外层引号；全角字母数字转半角（夹在中间的全角空格一起转，否则 TTS 会把它读成怪音，
-    比如「Ｈａｐｐｙ　Ｎｅｗｙｅａｒ」）；套读音表；换行合并。"""
+    比如「Ｈａｐｐｙ　Ｎｅｗｙｅａｒ」）；去掉句首的「～」（小样 73「～～～呃！？」读出过一个「克」，句中的照旧）；
+    套读音表（可能带拼音标注 <字|拼音声调>，见 lexicon.yaml）；换行合并。"""
     t = re.sub(r"[Ａ-Ｚａ-ｚ０-９]+(?:　[Ａ-Ｚａ-ｚ０-９]+)*", lambda m: unicodedata.normalize("NFKC", m.group()),
                row["text"].replace("\n", ""))
     if row["type"] == "台词":
         t = re.sub(r"^[“‘](.*)[”’]$", r"\1", t)
+    t = t.lstrip("～")
     for word, say in lexicon.items():
         t = t.replace(word, say)
     return t
